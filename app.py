@@ -13,6 +13,12 @@ Run:
 Then open the preview URL CodeSandbox gives you (or http://localhost:5000
 if running locally). Select one or more PDF packing lists, click
 "Count PKG", and an Excel file (one sheet per PDF) downloads automatically.
+
+
+
+================ for run python ====================
+python app.py
+===================================================
 """
 
 import os
@@ -36,7 +42,8 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # PDF PARSING
 # ---------------------------------------------------------------------------
 
-CML_RE = re.compile(r'^(?P<cml>\S+)\s+(?P<vol>[\d.]+)\s+(?P<nw>[\d.,]+)\s+(?P<gw>[\d.,]+)$')
+CML_RE = re.compile(
+    r'^(?P<cml>\S+)\s+(?P<vol>[\d.]+)\s+(?P<nw>[\d.,]+)\s+(?P<gw>[\d.,]+)$')
 
 ORDER_RE = re.compile(
     r'^(?P<order>\S+K\d+)\s+(?P<itemno>\S+)\s+(?P<unit>\S+)\s+'
@@ -155,12 +162,15 @@ def build_excel(all_results):
     wb.remove(wb.active)
 
     used_names = set()
-    header_fill = PatternFill(start_color="305496", end_color="305496", fill_type="solid")
+    header_fill = PatternFill(start_color="305496",
+                              end_color="305496", fill_type="solid")
     header_font = Font(bold=True, color="FFFFFF")
-    headers = ["Item No.", "Customer Item No.", "Description", "Unit", "PKG (Count)", "Total Qty"]
+    headers = ["Item No.", "Customer Item No.",
+               "Description", "Unit", "PKG (Count)", "Total Qty"]
 
     for pdf_name, rows in all_results:
-        sheet_title = safe_sheet_name(os.path.splitext(pdf_name)[0], used_names)
+        sheet_title = safe_sheet_name(
+            os.path.splitext(pdf_name)[0], used_names)
         ws = wb.create_sheet(title=sheet_title)
 
         ws.append(headers)
@@ -182,7 +192,8 @@ def build_excel(all_results):
                 val = [row["itemno"], row["custitem"], row["desc"],
                        row["unit"], str(row["count"]), str(row["total_qty"])][col_idx - 1]
                 max_len = max(max_len, len(str(val)))
-            ws.column_dimensions[get_column_letter(col_idx)].width = max_len + 4
+            ws.column_dimensions[get_column_letter(
+                col_idx)].width = max_len + 4
 
         ws.freeze_panes = "A2"
 
@@ -213,7 +224,8 @@ def count_pkg():
     for f in files:
         if not f.filename.lower().endswith(".pdf"):
             continue
-        temp_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4().hex}_{f.filename}")
+        temp_path = os.path.join(
+            UPLOAD_DIR, f"{uuid.uuid4().hex}_{f.filename}")
         f.save(temp_path)
         try:
             records = parse_packing_list(temp_path)
@@ -222,7 +234,8 @@ def count_pkg():
             preview.append({
                 "filename": f.filename,
                 "items": [
-                    {"itemno": r["itemno"], "desc": r["desc"], "pkg": r["count"], "qty": r["total_qty"]}
+                    {"itemno": r["itemno"], "desc": r["desc"],
+                        "pkg": r["count"], "qty": r["total_qty"]}
                     for r in summary
                 ],
             })
