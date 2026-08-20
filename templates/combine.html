@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <title>PKG Counter - Packing List Tool</title>
+    <title>Combine PDFs - INV / PL / Freight</title>
     <style>
       body {
         font-family: "Segoe UI", Arial, sans-serif;
@@ -30,7 +30,7 @@
         margin-bottom: 4px;
         color: #1f2d4d;
       }
-      a.tool-link {
+      a.back-btn {
         font-size: 13px;
         color: #305496;
         text-decoration: none;
@@ -39,7 +39,7 @@
         padding: 6px 12px;
         white-space: nowrap;
       }
-      a.tool-link:hover {
+      a.back-btn:hover {
         background: #305496;
         color: #fff;
       }
@@ -68,7 +68,7 @@
       #fileList li {
         margin-bottom: 4px;
       }
-      button#countBtn {
+      button#combineBtn {
         margin-top: 20px;
         width: 100%;
         padding: 12px;
@@ -79,7 +79,7 @@
         font-size: 15px;
         cursor: pointer;
       }
-      button#countBtn:disabled {
+      button#combineBtn:disabled {
         background: #9aa8c7;
         cursor: not-allowed;
       }
@@ -87,29 +87,7 @@
         margin-top: 14px;
         font-size: 14px;
         color: #555;
-      }
-      table {
-        width: 100%;
-        border-collapse: collapse;
-        margin-top: 14px;
-        font-size: 13px;
-      }
-      th,
-      td {
-        border: 1px solid #e2e6ee;
-        padding: 6px 8px;
-        text-align: left;
-      }
-      th {
-        background: #305496;
-        color: #fff;
-      }
-      .pdf-block {
-        margin-top: 22px;
-      }
-      .pdf-block h3 {
-        margin-bottom: 6px;
-        color: #1f2d4d;
+        white-space: pre-line;
       }
       #downloadBtn {
         display: none;
@@ -124,18 +102,33 @@
         text-align: center;
         text-decoration: none;
       }
+      .details-block {
+        margin-top: 18px;
+        font-size: 13px;
+        background: #f7f9fd;
+        border: 1px solid #e2e6ee;
+        border-radius: 8px;
+        padding: 14px;
+        white-space: pre-line;
+        color: #333;
+      }
+      .warn {
+        color: #b45309;
+      }
     </style>
   </head>
   <body>
     <div class="card">
       <div class="top-row">
-        <h1>Packing List PKG Counter</h1>
-        <a class="tool-link" href="combine">Combine PDFs Tool &rarr;</a>
+        <h1>Combine PDFs</h1>
+        <a class="back-btn" href="/">&larr; Back to PKG Counter</a>
       </div>
       <p class="subtitle">
-        Select one or more PDF packing lists, then click "Count PKG". You'll get
-        an Excel file with one sheet per PDF, each showing how many times every
-        item appears (PKG count).
+        Upload any mix of Invoice (INV_...), Packing List (PL_...), and Freight
+        (plain invoice-number filename, e.g. 651195.pdf) PDFs. They'll be
+        grouped by invoice number, ordered Invoice → Packing List → Freight, and
+        merged from the smallest invoice number to the largest. Invoices missing
+        a freight file are combined anyway.
       </p>
 
       <div class="drop-zone" id="dropZone">
@@ -144,21 +137,20 @@
       </div>
       <ul id="fileList"></ul>
 
-      <button id="countBtn" disabled>Count PKG</button>
+      <button id="combineBtn" disabled>Combine PDFs</button>
       <div id="status"></div>
-      <a id="downloadBtn" href="#">⬇ Download Excel Report</a>
-
-      <div id="results"></div>
+      <a id="downloadBtn" href="#">⬇ Download Combined PDF</a>
+      <div id="detailsBlock" class="details-block" style="display: none"></div>
     </div>
 
     <script>
       const dropZone = document.getElementById("dropZone");
       const pdfInput = document.getElementById("pdfInput");
       const fileList = document.getElementById("fileList");
-      const countBtn = document.getElementById("countBtn");
+      const combineBtn = document.getElementById("combineBtn");
       const statusDiv = document.getElementById("status");
-      const resultsDiv = document.getElementById("results");
       const downloadBtn = document.getElementById("downloadBtn");
+      const detailsBlock = document.getElementById("detailsBlock");
 
       dropZone.addEventListener("click", () => pdfInput.click());
 
@@ -170,53 +162,55 @@
           li.textContent = f.name;
           fileList.appendChild(li);
         });
-        countBtn.disabled = files.length === 0;
+        combineBtn.disabled = files.length === 0;
         downloadBtn.style.display = "none";
-        resultsDiv.innerHTML = "";
+        detailsBlock.style.display = "none";
+        statusDiv.textContent = "";
       });
 
-      countBtn.addEventListener("click", async () => {
+      combineBtn.addEventListener("click", async () => {
         const files = pdfInput.files;
         if (!files.length) return;
 
         const formData = new FormData();
         for (const f of files) formData.append("pdfs", f);
 
-        countBtn.disabled = true;
-        statusDiv.textContent = "Processing...";
-        resultsDiv.innerHTML = "";
+        combineBtn.disabled = true;
+        statusDiv.textContent = "Combining...";
         downloadBtn.style.display = "none";
+        detailsBlock.style.display = "none";
 
         try {
-          const res = await fetch("/count", { method: "POST", body: formData });
+          const res = await fetch("/combine", {
+            method: "POST",
+            body: formData,
+          });
           const data = await res.json();
 
           if (!res.ok) {
             statusDiv.textContent =
               "Error: " + (data.error || "Something went wrong.");
-            countBtn.disabled = false;
+            combineBtn.disabled = false;
             return;
           }
 
-          statusDiv.textContent = "Done!";
-          data.preview.forEach((pdf) => {
-            const block = document.createElement("div");
-            block.className = "pdf-block";
-            let html = `<h3>${pdf.filename}</h3><table><tr><th>Item No.</th><th>Description</th><th>PKG (Count)</th><th>Total Qty</th></tr>`;
-            pdf.items.forEach((item) => {
-              html += `<tr><td>${item.itemno}</td><td>${item.desc}</td><td>${item.pkg}</td><td>${item.qty}</td></tr>`;
-            });
-            html += `</table>`;
-            block.innerHTML = html;
-            resultsDiv.appendChild(block);
-          });
+          statusDiv.textContent = `Done! Combined ${data.invoice_count} invoice group(s).`;
 
-          downloadBtn.href = "/download/" + data.download_id;
+          let detailsText = data.details.join("\n");
+          if (data.unclassified && data.unclassified.length) {
+            detailsText +=
+              "\n\nSkipped (couldn't classify):\n" +
+              data.unclassified.join("\n");
+          }
+          detailsBlock.textContent = detailsText;
+          detailsBlock.style.display = "block";
+
+          downloadBtn.href = "/download_combine/" + data.download_id;
           downloadBtn.style.display = "block";
         } catch (err) {
           statusDiv.textContent = "Error: " + err.message;
         } finally {
-          countBtn.disabled = false;
+          combineBtn.disabled = false;
         }
       });
     </script>

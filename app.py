@@ -1,49 +1,33 @@
 """
-PKG Counter - Web App (Flask)
-=============================
+PKG Counter + Combine PDFs - Web App (Flask)
+=============================================
 Runs in the browser - works great on CodeSandbox, Replit, or any
 container with no display (no tkinter needed).
 
 Install:
-    pip install flask pdfplumber openpyxl
+    pip install flask pdfplumber openpyxl pypdf
 
 Run:
     python app.py
 
-Then open the preview URL CodeSandbox gives you (or http://localhost:5000
-if running locally). Select one or more PDF packing lists, click
-"Count PKG", and an Excel file downloads automatically.
+Then open the preview URL CodeSandbox gives you (or http://localhost:8080
+if running locally).
 
-Output workbook layout:
-  - One "item summary" sheet PER PDF (same as before: Item No.,
-    Description, PKG count, Qty) - named after the PDF file.
-  - ONE single combined "PKG Summary" sheet (not per PDF) listing every
-    package (CML No.) from every uploaded PDF, with a Description column
-    (falls back to Customer Item No. if the description text couldn't be
-    detected), Net Weight, Gross Weight, a subtotal per invoice, and a
-    Grand Total at the end.
-
-Parsing note on Description / Customer Item No.:
-  Normally a line looks like "KN127314-3110 TUBE" -> Customer Item No.
-  "KN127314-3110", Description "TUBE", both on the same line. Sometimes
-  the description text is missing from that line (only the Customer Item
-  No. token is present) and the actual name appears by itself on the
-  next line instead. The parser now looks ahead for that case, and if it
-  still can't find a description anywhere, it falls back to displaying
-  the Customer Item No. as the name so the row is never blank.
-
-
-
-================ for run python ====================
-python app.py
-===================================================
+Two tools in this app:
+  1. PKG Counter ("/")        - upload packing list PDFs, get an Excel
+                                 report of PKG counts.
+  2. Combine PDFs ("/combine") - upload INV / PL / Freight PDFs, get them
+                                 merged into one PDF, grouped by invoice
+                                 number and ordered INV -> PL -> Freight.
 """
 
 import os
 import re
 import io
 import uuid
+import shutil
 from collections import OrderedDict
+from combinepdf import combine
 
 from flask import Flask, request, render_template, send_file, jsonify
 import pdfplumber
@@ -57,7 +41,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
-# PDF PARSING
+# PDF PARSING (PKG Counter)
 # ---------------------------------------------------------------------------
 
 # CML No.   Volume(m3)   Net Weight(kg)   Gross Weight(kg)
@@ -89,8 +73,6 @@ def parse_packing_list(pdf_path):
                {"cml": ..., "vol": float, "nw": float, "gw": float}
                (used for the combined PKG weight sheet)
     """
-    # Flatten all pages into one list of stripped, non-header lines so we
-    # can look ahead across line boundaries when a description is missing.
     lines = []
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
@@ -137,14 +119,10 @@ def parse_packing_list(pdf_path):
 
             m = DESC_RE.match(line)
             if m:
-                # Normal case: "KN127314-3110 TUBE" on one line
                 custitem = m.group("custitem")
                 desc = m.group("desc").strip()
                 i += 1
             elif " " not in line:
-                # Only the Customer Item No. token is on this line - the
-                # description (if any) may be sitting by itself on the
-                # next line.
                 custitem = line
                 i += 1
                 if i < n:
@@ -154,7 +132,6 @@ def parse_packing_list(pdf_path):
                         desc = nxt.strip()
                         i += 1
             else:
-                # Unexpected shape - treat the whole line as the description
                 desc = line.strip()
                 i += 1
 
@@ -166,14 +143,12 @@ def parse_packing_list(pdf_path):
             pending_order = None
             continue
 
-        # Unrecognized line (stray text) - skip it
         i += 1
 
     return records, packages
 
 
 def display_name(custitem, desc):
-    """Description if we have one, otherwise fall back to Customer Item No."""
     desc = (desc or "").strip()
     if desc:
         return desc
@@ -181,24 +156,6 @@ def display_name(custitem, desc):
 
 
 def summarize_by_name(records):
-    """
-    Groups line items by their CML (physical package) first, then by item name.
-
-    - If a package contains the SAME item split across multiple order lines
-      (e.g. two order numbers for the same part in one CML), they are merged
-      and counted as ONE pkg for that package, not two.
-    - If a package contains DIFFERENT items mixed together in one CML, only
-      the item with the largest net weight in that package gets +1 pkg;
-      the other items in that same package get +0 (that package is already
-      accounted for by the winner).
-
-    The final "count" per item is the sum of its pkg contributions across
-    every package (CML) it appeared in.
-
-    Also returns package_names: OrderedDict of CML No. -> display name
-    (Description, falling back to Customer Item No.) for the item that
-    "won" that package - used by the PKG Summary sheet.
-    """
     cml_groups = OrderedDict()
     for r in records:
         cml_groups.setdefault(r["cml"], []).append(r)
@@ -237,7 +194,7 @@ def summarize_by_name(records):
 
 
 # ---------------------------------------------------------------------------
-# EXCEL EXPORT
+# EXCEL EXPORT (PKG Counter)
 # ---------------------------------------------------------------------------
 
 def safe_sheet_name(name, used_names):
@@ -262,7 +219,6 @@ def style_header(ws, headers, header_fill, header_font):
 
 
 def autosize(ws, headers, rows_as_strs):
-    """rows_as_strs: list of lists of strings, one list per data row."""
     for col_idx, header in enumerate(headers, start=1):
         max_len = len(header)
         for row in rows_as_strs:
@@ -271,15 +227,6 @@ def autosize(ws, headers, rows_as_strs):
 
 
 def build_excel(all_results):
-    """
-    all_results: list of (pdf_name, item_summary_rows, package_rows, package_names)
-    Returns an in-memory Excel file (BytesIO):
-
-      - one item-summary sheet PER PDF (same as the old code)
-      - ONE single combined "PKG Summary" sheet with Description (falls
-        back to Customer Item No.), Net Weight, Gross Weight per package,
-        subtotal per invoice, and a grand total
-    """
     wb = Workbook()
     wb.remove(wb.active)
 
@@ -297,7 +244,6 @@ def build_excel(all_results):
     item_headers = ["Item No.", "Customer Item No.",
                      "Description", "Unit", "PKG (Count)", "Total Qty"]
 
-    # --- One item-summary sheet per PDF (unchanged, like the old code) ---
     for pdf_name, rows, packages, package_names in all_results:
         base_title = os.path.splitext(pdf_name)[0]
         sheet_title = safe_sheet_name(base_title, used_names)
@@ -317,7 +263,6 @@ def build_excel(all_results):
         autosize(ws, item_headers, row_strs)
         ws.freeze_panes = "A2"
 
-    # --- One single combined PKG Summary sheet ---
     pkg_headers = ["Invoice", "CML No.", "Description",
                    "Net Weight (kg)", "Gross Weight (kg)"]
     ws_pkg = wb.create_sheet(title="PKG Summary")
@@ -342,7 +287,6 @@ def build_excel(all_results):
             inv_nw += pkg["nw"]
             inv_gw += pkg["gw"]
 
-        # Subtotal row for this invoice
         sub_row_idx = ws_pkg.max_row + 1
         ws_pkg.append([invoice_label, f"Subtotal ({len(packages)} pkg)", "",
                         round(inv_nw, 3), round(inv_gw, 3)])
@@ -358,7 +302,6 @@ def build_excel(all_results):
         grand_gw += inv_gw
         grand_pkg_count += len(packages)
 
-    # Grand total row across all invoices
     grand_row_idx = ws_pkg.max_row + 1
     ws_pkg.append(["", f"Grand Total ({grand_pkg_count} pkg)", "",
                     round(grand_nw, 3), round(grand_gw, 3)])
@@ -380,7 +323,7 @@ def build_excel(all_results):
 
 
 # ---------------------------------------------------------------------------
-# ROUTES
+# ROUTES - PKG Counter
 # ---------------------------------------------------------------------------
 
 @app.route("/")
@@ -395,7 +338,7 @@ def count_pkg():
         return jsonify({"error": "No files uploaded."}), 400
 
     all_results = []
-    preview = []  # for showing counts back on the page
+    preview = []
 
     for f in files:
         if not f.filename.lower().endswith(".pdf"):
@@ -436,7 +379,6 @@ def count_pkg():
 
     excel_buffer = build_excel(all_results)
 
-    # Store the excel temporarily so the frontend can fetch it via a download link
     report_id = uuid.uuid4().hex
     report_path = os.path.join(UPLOAD_DIR, f"{report_id}.xlsx")
     with open(report_path, "wb") as out:
@@ -455,6 +397,60 @@ def download(report_id):
         as_attachment=True,
         download_name="PKG_Count_Report.xlsx",
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+# ---------------------------------------------------------------------------
+# ROUTES - Combine PDFs
+# ---------------------------------------------------------------------------
+
+@app.route("/combine")
+def combine_page():
+    return render_template("combine.html")
+
+
+@app.route("/combine", methods=["POST"])
+def combine_pdfs_route():
+    files = request.files.getlist("pdfs")
+    if not files or files[0].filename == "":
+        return jsonify({"error": "No files uploaded."}), 400
+
+    batch_id = uuid.uuid4().hex
+    batch_folder = os.path.join(UPLOAD_DIR, f"combine_{batch_id}")
+    os.makedirs(batch_folder, exist_ok=True)
+
+    for f in files:
+        if f.filename.lower().endswith(".pdf"):
+            f.save(os.path.join(batch_folder, f.filename))
+
+    output_path = os.path.join(UPLOAD_DIR, f"combined_{batch_id}.pdf")
+
+    try:
+        result = combine(batch_folder, output_path)
+    except ValueError as e:
+        shutil.rmtree(batch_folder, ignore_errors=True)
+        return jsonify({"error": str(e)}), 400
+
+    shutil.rmtree(batch_folder, ignore_errors=True)
+
+    return jsonify({
+        "invoice_count": result["invoice_count"],
+        "details": result["details"],
+        "unclassified": result["unclassified"],
+        "download_id": f"combined_{batch_id}",
+    })
+
+
+@app.route("/download_combine/<download_id>")
+def download_combine(download_id):
+    file_path = os.path.join(UPLOAD_DIR, f"{download_id}.pdf")
+    if not os.path.isfile(file_path):
+        return "File not found or expired.", 404
+    return send_file(
+        file_path,
+        as_attachment=True,
+        download_name="combined_output.pdf",
+        mimetype="application/pdf",
     )
 
 
