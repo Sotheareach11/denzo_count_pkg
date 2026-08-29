@@ -15,7 +15,10 @@ if running locally).
 
 Two tools in this app:
   1. PKG Counter ("/")        - upload packing list PDFs, get an Excel
-                                 report of PKG counts.
+                                 report of PKG counts. The "PKG Summary"
+                                 sheet is grouped first by Ship To
+                                 (factory) detected in each PDF, then by
+                                 invoice within each factory.
   2. Combine PDFs ("/combine") - upload INV / PL / Freight PDFs, get them
                                  merged into one PDF, grouped by invoice
                                  number and ordered INV -> PL -> Freight.
@@ -61,10 +64,51 @@ HEADER_PREFIXES = (
     "Page", "Total Package",
 )
 
+# Marker used to find the "Ship to" company name on page 1.
+SHIP_TO_MARKER_RE = re.compile(r'Ship\s*to', re.IGNORECASE)
+COMPANY_HINT_RE = re.compile(r'CO\.,?\s*LTD', re.IGNORECASE)
+
+
+def extract_ship_to(first_page_text):
+    """
+    Detects the "Ship to" company / factory name from the raw text of a
+    packing list's first page.
+
+    pdfplumber often merges the "Sold to" and "Ship to" table columns onto
+    the same line (since they sit at the same y-position in the PDF), e.g.:
+
+        Ship to Document Information DENSO (THAILAND) CO., LTD.
+        DENSO (THAILAND) CO., LTD. Document Type NORMAL ...
+
+    So instead of taking a whole line, we find the "Ship to" marker and
+    then grab text up to (and including) the *first* "CO., LTD." style
+    company suffix that follows it - that's the factory name, and it
+    stops before any of the following merged-in text.
+
+    Returns the company name (e.g. "DENSO (THAILAND) CO., LTD.") or
+    "Unknown" if it can't be found, so a PDF with an unrecognised layout
+    still gets grouped (under "Unknown") instead of crashing the report.
+    """
+    text = " ".join(first_page_text.split())  # collapse all whitespace/newlines
+
+    m = SHIP_TO_MARKER_RE.search(text)
+    if not m:
+        return "Unknown"
+
+    tail = text[m.end():]
+    # "Document Information" is the merged-in column header next to "Ship to" - drop it.
+    tail = re.sub(r'^\s*Document Information\s*', '', tail, flags=re.IGNORECASE)
+
+    company_match = re.match(r'\s*(.*?CO\.,?\s*LTD\.?)', tail, re.IGNORECASE)
+    if company_match:
+        return company_match.group(1).strip()
+
+    return "Unknown"
+
 
 def parse_packing_list(pdf_path):
     """
-    Returns (records, packages)
+    Returns (records, packages, ship_to)
 
     records  - one dict per order line (used for the item summary sheet).
                Always has both "custitem" and "desc" filled in as best as
@@ -72,11 +116,16 @@ def parse_packing_list(pdf_path):
     packages - OrderedDict keyed by CML No., each value:
                {"cml": ..., "vol": float, "nw": float, "gw": float}
                (used for the combined PKG weight sheet)
+    ship_to  - detected Ship To company / factory name (string), used to
+               group the PKG Summary sheet by factory.
     """
     lines = []
+    ship_to = "Unknown"
     with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
+        for page_idx, page in enumerate(pdf.pages):
             text = page.extract_text() or ""
+            if page_idx == 0:
+                ship_to = extract_ship_to(text)
             for raw_line in text.split("\n"):
                 line = raw_line.strip()
                 if not line:
@@ -145,7 +194,7 @@ def parse_packing_list(pdf_path):
 
         i += 1
 
-    return records, packages
+    return records, packages, ship_to
 
 
 def display_name(custitem, desc):
@@ -227,6 +276,10 @@ def autosize(ws, headers, rows_as_strs):
 
 
 def build_excel(all_results):
+    """
+    all_results: list of tuples
+        (pdf_name, item_rows, packages, package_names, ship_to)
+    """
     wb = Workbook()
     wb.remove(wb.active)
 
@@ -237,6 +290,12 @@ def build_excel(all_results):
     sub_fill = PatternFill(start_color="D9E1F2",
                            end_color="D9E1F2", fill_type="solid")
     sub_font = Font(bold=True)
+    factory_fill = PatternFill(start_color="8EA9DB",
+                               end_color="8EA9DB", fill_type="solid")
+    factory_font = Font(bold=True)
+    section_fill = PatternFill(start_color="203864",
+                               end_color="203864", fill_type="solid")
+    section_font = Font(bold=True, color="FFFFFF")
     grand_fill = PatternFill(start_color="305496",
                              end_color="305496", fill_type="solid")
     grand_font = Font(bold=True, color="FFFFFF")
@@ -244,7 +303,8 @@ def build_excel(all_results):
     item_headers = ["Item No.", "Customer Item No.",
                      "Description", "Unit", "PKG (Count)", "Total Qty"]
 
-    for pdf_name, rows, packages, package_names in all_results:
+    # ---- Per-invoice item summary sheets ----
+    for pdf_name, rows, packages, package_names, ship_to in all_results:
         base_title = os.path.splitext(pdf_name)[0]
         sheet_title = safe_sheet_name(base_title, used_names)
         ws = wb.create_sheet(title=sheet_title)
@@ -263,54 +323,96 @@ def build_excel(all_results):
         autosize(ws, item_headers, row_strs)
         ws.freeze_panes = "A2"
 
-    pkg_headers = ["Invoice", "CML No.", "Description",
+    # ---- PKG Summary sheet, grouped by Ship To (factory), then invoice ----
+    pkg_headers = ["Ship To", "Invoice", "CML No.", "Description",
                    "Net Weight (kg)", "Gross Weight (kg)"]
     ws_pkg = wb.create_sheet(title="PKG Summary")
     style_header(ws_pkg, pkg_headers, header_fill, header_font)
+
+    # Group results by detected Ship To, preserving first-seen order.
+    grouped_by_ship_to = OrderedDict()
+    for pdf_name, rows, packages, package_names, ship_to in all_results:
+        grouped_by_ship_to.setdefault(ship_to, []).append(
+            (pdf_name, packages, package_names))
 
     pkg_row_strs = []
     grand_nw = 0.0
     grand_gw = 0.0
     grand_pkg_count = 0
 
-    for pdf_name, rows, packages, package_names in all_results:
-        invoice_label = os.path.splitext(pdf_name)[0]
-        inv_nw = 0.0
-        inv_gw = 0.0
-
-        for pkg in packages.values():
-            name = package_names.get(pkg["cml"], "")
-            ws_pkg.append([invoice_label, pkg["cml"], name, pkg["nw"], pkg["gw"]])
-            pkg_row_strs.append(
-                [invoice_label, pkg["cml"], name,
-                 f'{pkg["nw"]:.3f}', f'{pkg["gw"]:.3f}'])
-            inv_nw += pkg["nw"]
-            inv_gw += pkg["gw"]
-
-        sub_row_idx = ws_pkg.max_row + 1
-        ws_pkg.append([invoice_label, f"Subtotal ({len(packages)} pkg)", "",
-                        round(inv_nw, 3), round(inv_gw, 3)])
+    for ship_to, items in grouped_by_ship_to.items():
+        # --- Factory section header row ---
+        section_row_idx = ws_pkg.max_row + 1
+        ws_pkg.append([f"Ship To: {ship_to}", "", "", "", "", ""])
+        ws_pkg.merge_cells(start_row=section_row_idx, start_column=1,
+                            end_row=section_row_idx, end_column=len(pkg_headers))
         for col_idx in range(1, len(pkg_headers) + 1):
-            cell = ws_pkg.cell(row=sub_row_idx, column=col_idx)
-            cell.fill = sub_fill
-            cell.font = sub_font
+            cell = ws_pkg.cell(row=section_row_idx, column=col_idx)
+            cell.fill = section_fill
+            cell.font = section_font
+        pkg_row_strs.append([f"Ship To: {ship_to}", "", "", "", "", ""])
+
+        ship_nw = 0.0
+        ship_gw = 0.0
+        ship_pkg_count = 0
+
+        for pdf_name, packages, package_names in items:
+            invoice_label = os.path.splitext(pdf_name)[0]
+            inv_nw = 0.0
+            inv_gw = 0.0
+
+            for pkg in packages.values():
+                name = package_names.get(pkg["cml"], "")
+                ws_pkg.append([ship_to, invoice_label, pkg["cml"], name,
+                               pkg["nw"], pkg["gw"]])
+                pkg_row_strs.append(
+                    [ship_to, invoice_label, pkg["cml"], name,
+                     f'{pkg["nw"]:.3f}', f'{pkg["gw"]:.3f}'])
+                inv_nw += pkg["nw"]
+                inv_gw += pkg["gw"]
+
+            sub_row_idx = ws_pkg.max_row + 1
+            ws_pkg.append([ship_to, invoice_label,
+                            f"Subtotal ({len(packages)} pkg)", "",
+                            round(inv_nw, 3), round(inv_gw, 3)])
+            for col_idx in range(1, len(pkg_headers) + 1):
+                cell = ws_pkg.cell(row=sub_row_idx, column=col_idx)
+                cell.fill = sub_fill
+                cell.font = sub_font
+            pkg_row_strs.append(
+                [ship_to, invoice_label, f"Subtotal ({len(packages)} pkg)", "",
+                 f"{inv_nw:.3f}", f"{inv_gw:.3f}"])
+
+            ship_nw += inv_nw
+            ship_gw += inv_gw
+            ship_pkg_count += len(packages)
+
+        # --- Factory (Ship To) subtotal row ---
+        factory_row_idx = ws_pkg.max_row + 1
+        ws_pkg.append(["", f"{ship_to} Total ({ship_pkg_count} pkg)", "", "",
+                        round(ship_nw, 3), round(ship_gw, 3)])
+        for col_idx in range(1, len(pkg_headers) + 1):
+            cell = ws_pkg.cell(row=factory_row_idx, column=col_idx)
+            cell.fill = factory_fill
+            cell.font = factory_font
         pkg_row_strs.append(
-            [invoice_label, f"Subtotal ({len(packages)} pkg)", "",
-             f"{inv_nw:.3f}", f"{inv_gw:.3f}"])
+            ["", f"{ship_to} Total ({ship_pkg_count} pkg)", "", "",
+             f"{ship_nw:.3f}", f"{ship_gw:.3f}"])
 
-        grand_nw += inv_nw
-        grand_gw += inv_gw
-        grand_pkg_count += len(packages)
+        grand_nw += ship_nw
+        grand_gw += ship_gw
+        grand_pkg_count += ship_pkg_count
 
+    # --- Grand total row across all factories ---
     grand_row_idx = ws_pkg.max_row + 1
-    ws_pkg.append(["", f"Grand Total ({grand_pkg_count} pkg)", "",
+    ws_pkg.append(["", f"Grand Total ({grand_pkg_count} pkg)", "", "",
                     round(grand_nw, 3), round(grand_gw, 3)])
     for col_idx in range(1, len(pkg_headers) + 1):
         cell = ws_pkg.cell(row=grand_row_idx, column=col_idx)
         cell.fill = grand_fill
         cell.font = grand_font
     pkg_row_strs.append(
-        ["", f"Grand Total ({grand_pkg_count} pkg)", "",
+        ["", f"Grand Total ({grand_pkg_count} pkg)", "", "",
          f"{grand_nw:.3f}", f"{grand_gw:.3f}"])
 
     autosize(ws_pkg, pkg_headers, pkg_row_strs)
@@ -347,15 +449,17 @@ def count_pkg():
             UPLOAD_DIR, f"{uuid.uuid4().hex}_{f.filename}")
         f.save(temp_path)
         try:
-            records, packages = parse_packing_list(temp_path)
+            records, packages, ship_to = parse_packing_list(temp_path)
             summary, package_names = summarize_by_name(records)
-            all_results.append((f.filename, summary, packages, package_names))
+            all_results.append(
+                (f.filename, summary, packages, package_names, ship_to))
 
             total_nw = sum(p["nw"] for p in packages.values())
             total_gw = sum(p["gw"] for p in packages.values())
 
             preview.append({
                 "filename": f.filename,
+                "ship_to": ship_to,
                 "items": [
                     {"itemno": r["itemno"],
                         "desc": display_name(r["custitem"], r["desc"]),
