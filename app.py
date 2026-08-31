@@ -44,7 +44,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
-# PDF PARSING (PKG Counter)
+# PDF PARSING (PKG Counter) 111
 # ---------------------------------------------------------------------------
 
 # CML No.   Volume(m3)   Net Weight(kg)   Gross Weight(kg)
@@ -89,7 +89,8 @@ def extract_ship_to(first_page_text):
     "Unknown" if it can't be found, so a PDF with an unrecognised layout
     still gets grouped (under "Unknown") instead of crashing the report.
     """
-    text = " ".join(first_page_text.split())  # collapse all whitespace/newlines
+    text = " ".join(first_page_text.split()
+                    )  # collapse all whitespace/newlines
 
     m = SHIP_TO_MARKER_RE.search(text)
     if not m:
@@ -97,7 +98,8 @@ def extract_ship_to(first_page_text):
 
     tail = text[m.end():]
     # "Document Information" is the merged-in column header next to "Ship to" - drop it.
-    tail = re.sub(r'^\s*Document Information\s*', '', tail, flags=re.IGNORECASE)
+    tail = re.sub(r'^\s*Document Information\s*',
+                  '', tail, flags=re.IGNORECASE)
 
     company_match = re.match(r'\s*(.*?CO\.,?\s*LTD\.?)', tail, re.IGNORECASE)
     if company_match:
@@ -301,7 +303,7 @@ def build_excel(all_results):
     grand_font = Font(bold=True, color="FFFFFF")
 
     item_headers = ["Item No.", "Customer Item No.",
-                     "Description", "Unit", "PKG (Count)", "Total Qty"]
+                    "Description", "Unit", "PKG (Count)", "Total Qty"]
 
     # ---- Per-invoice item summary sheets ----
     for pdf_name, rows, packages, package_names, ship_to in all_results:
@@ -345,7 +347,7 @@ def build_excel(all_results):
         section_row_idx = ws_pkg.max_row + 1
         ws_pkg.append([f"Ship To: {ship_to}", "", "", "", "", ""])
         ws_pkg.merge_cells(start_row=section_row_idx, start_column=1,
-                            end_row=section_row_idx, end_column=len(pkg_headers))
+                           end_row=section_row_idx, end_column=len(pkg_headers))
         for col_idx in range(1, len(pkg_headers) + 1):
             cell = ws_pkg.cell(row=section_row_idx, column=col_idx)
             cell.fill = section_fill
@@ -373,8 +375,8 @@ def build_excel(all_results):
 
             sub_row_idx = ws_pkg.max_row + 1
             ws_pkg.append([ship_to, invoice_label,
-                            f"Subtotal ({len(packages)} pkg)", "",
-                            round(inv_nw, 3), round(inv_gw, 3)])
+                           f"Subtotal ({len(packages)} pkg)", "",
+                           round(inv_nw, 3), round(inv_gw, 3)])
             for col_idx in range(1, len(pkg_headers) + 1):
                 cell = ws_pkg.cell(row=sub_row_idx, column=col_idx)
                 cell.fill = sub_fill
@@ -390,7 +392,7 @@ def build_excel(all_results):
         # --- Factory (Ship To) subtotal row ---
         factory_row_idx = ws_pkg.max_row + 1
         ws_pkg.append(["", f"{ship_to} Total ({ship_pkg_count} pkg)", "", "",
-                        round(ship_nw, 3), round(ship_gw, 3)])
+                       round(ship_nw, 3), round(ship_gw, 3)])
         for col_idx in range(1, len(pkg_headers) + 1):
             cell = ws_pkg.cell(row=factory_row_idx, column=col_idx)
             cell.fill = factory_fill
@@ -406,7 +408,7 @@ def build_excel(all_results):
     # --- Grand total row across all factories ---
     grand_row_idx = ws_pkg.max_row + 1
     ws_pkg.append(["", f"Grand Total ({grand_pkg_count} pkg)", "", "",
-                    round(grand_nw, 3), round(grand_gw, 3)])
+                   round(grand_nw, 3), round(grand_gw, 3)])
     for col_idx in range(1, len(pkg_headers) + 1):
         cell = ws_pkg.cell(row=grand_row_idx, column=col_idx)
         cell.fill = grand_fill
