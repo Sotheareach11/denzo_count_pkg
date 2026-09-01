@@ -1,7 +1,7 @@
 astroid==3.2.4
 autopep8==2.0.4
 blinker==1.8.2
-cffi==1.17.1
+cffi>=2.0.0
 charset-normalizer==3.5.1
 click==8.1.8
 cryptography==47.0.0
