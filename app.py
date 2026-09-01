@@ -48,20 +48,57 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # ---------------------------------------------------------------------------
 
 # CML No.   Volume(m3)   Net Weight(kg)   Gross Weight(kg)
+# Strict form: CML No. is immediately followed by the three numbers, with
+# nothing else in between, e.g. "STG002608060339 0.005 1.200 1.525"
 CML_RE = re.compile(
     r'^(?P<cml>\S+)\s+(?P<vol>[\d.]+)\s+(?P<nw>[\d.,]+)\s+(?P<gw>[\d.,]+)$')
 
+# Looser CML line variant: some templates (e.g. DENSO's "Return Style Code"
+# layout) put a free-text field between the CML No. and the trailing
+# Volume/Net Weight/Gross Weight numbers, e.g.:
+#   "DTG0T11C607240160 PLASTIC PACKAGING (Plastic Slipsheet) 1.156 170.000 170.000"
+# This is only tried after CML_RE *and* the item/model line patterns below
+# have all failed to match, so it can never swallow an item/model line.
+CML_RE_LOOSE = re.compile(
+    r'^(?P<cml>\S+)\s+.+?\s+(?P<vol>[\d.]+)\s+(?P<nw>[\d.,]+)\s+(?P<gw>[\d.,]+)$')
+
+# "Normal" template: Customer Order No. Item No. PKG UNIT QTY Total N/W(kg) No. of Cartons
+# all on one line, and the order no. looks like "...K123".
 ORDER_RE = re.compile(
     r'^(?P<order>\S+K\d+)\s+(?P<itemno>\S+)\s+(?P<unit>\S+)\s+'
     r'(?P<qty>[\d,]+)\s+(?P<totalnw>[\d.,]+)\s+(?P<cartons>\d+)$'
 )
 
-# "KN127314-3110 TUBE" -> custitem + desc, both on the same line
-DESC_RE = re.compile(r'^(?P<custitem>\S+)\s+(?P<desc>.+)$')
+# Some templates (e.g. DENSO (Thailand)) put Item No. / UNIT / QTY / Total N/W
+# on their own line with NO order number and NO cartons value, e.g.:
+#   "TG022108-00509B pcs 60 1.200"
+# The Customer Order No. then shows up on the FOLLOWING line together with
+# the Description (Customer Item No. is left blank), e.g.:
+#   "TG022108-0050 SWITCH THERMO"
+ITEM_LINE_RE = re.compile(
+    r'^(?P<itemno>\S+)\s+(?P<unit>\S+)\s+(?P<qty>[\d,]+)\s+(?P<totalnw>[\d.,]+)$'
+)
+ORDER_DESC_RE = re.compile(r'^(?P<order>\S+)\s+(?P<desc>.+)$')
+
+# "Return Style Code" template: Model line has an extra per-unit N/W(kg)
+# column before the Total N/W(kg), e.g. "N73T pcs 10 16.700 167.000", with
+# only a plain description following (no order/customer-item number), e.g.
+# "PLASTIC PACKAGING". Item No. is left blank in this template, so "Model"
+# (e.g. "N73T") is used as the item number.
+MODEL_LINE_RE = re.compile(
+    r'^(?P<itemno>\S+)\s+(?P<unit>\S+)\s+(?P<qty>[\d,]+)\s+'
+    r'(?P<nw_unit>[\d.,]+)\s+(?P<totalnw>[\d.,]+)$'
+)
+
+# "KN127314-3110 TUBE" -> custitem + desc, both on the same line.
+# Require the first token to contain a digit so it looks like an item code
+# (otherwise a plain description like "SWITCH THERMO" would get wrongly
+# split into custitem="SWITCH" desc="THERMO").
+DESC_RE = re.compile(r'^(?P<custitem>\S*\d\S*)\s+(?P<desc>.+)$')
 
 HEADER_PREFIXES = (
     "CML No.", "Customer Order No.", "Customer Item No.",
-    "Page", "Total Package",
+    "Page", "Total Package", "Model",
 )
 
 # Marker used to find the "Ship to" company name on page 1.
@@ -164,6 +201,66 @@ def parse_packing_list(pdf_path):
             i += 1
             continue
 
+        # Template variant: Model line with an extra per-unit N/W(kg) column,
+        # e.g. "N73T pcs 10 16.700 167.000", followed by a plain description
+        # line with no order/customer-item number, e.g. "PLASTIC PACKAGING".
+        m = MODEL_LINE_RE.match(line)
+        if m:
+            info = m.groupdict()
+            info.pop("nw_unit", None)
+            info["cartons"] = "0"
+            info["order"] = ""
+            pending_order = info
+            i += 1
+            continue
+
+        # Template variant: item info (itemno/unit/qty/totalnw) on its own
+        # line, no order no. and no cartons - the order no. + description
+        # come together on the next line.
+        m = ITEM_LINE_RE.match(line)
+        if m:
+            item_info = m.groupdict()
+            item_info["cartons"] = "0"
+            item_info["order"] = ""
+            consumed_next = False
+            if i + 1 < n:
+                nxt = lines[i + 1]
+                if not CML_RE.match(nxt) and not CML_RE_LOOSE.match(nxt) and not ORDER_RE.match(nxt) \
+                        and not MODEL_LINE_RE.match(nxt) and not ITEM_LINE_RE.match(nxt):
+                    om = ORDER_DESC_RE.match(nxt)
+                    if om:
+                        item_info["order"] = om.group("order")
+                        rec = dict(item_info)
+                        rec["cml"] = cur_cml
+                        rec["custitem"] = ""
+                        rec["desc"] = om.group("desc").strip()
+                        records.append(rec)
+                        i += 2
+                        consumed_next = True
+            if not consumed_next:
+                # No matching order/desc line followed - fall back to the
+                # normal pending_order flow so we still capture something
+                # instead of dropping the item.
+                pending_order = item_info
+                i += 1
+            continue
+
+        # Loose CML line (CML No. + free-text return style code + vol/nw/gw).
+        # Only tried after the strict CML_RE and every item/model/order
+        # pattern above have failed, so it can't accidentally swallow an
+        # item or model line.
+        m = CML_RE_LOOSE.match(line)
+        if m:
+            cur_cml = m.group("cml")
+            packages[cur_cml] = {
+                "cml": cur_cml,
+                "vol": float(m.group("vol")),
+                "nw": float(m.group("nw").replace(",", "")),
+                "gw": float(m.group("gw").replace(",", "")),
+            }
+            i += 1
+            continue
+
         if pending_order is not None:
             custitem = ""
             desc = ""
@@ -178,7 +275,8 @@ def parse_packing_list(pdf_path):
                 i += 1
                 if i < n:
                     nxt = lines[i]
-                    if not CML_RE.match(nxt) and not ORDER_RE.match(nxt) \
+                    if not CML_RE.match(nxt) and not CML_RE_LOOSE.match(nxt) and not ORDER_RE.match(nxt) \
+                            and not MODEL_LINE_RE.match(nxt) and not ITEM_LINE_RE.match(nxt) \
                             and not nxt.startswith(HEADER_PREFIXES):
                         desc = nxt.strip()
                         i += 1
