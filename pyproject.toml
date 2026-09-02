@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "denso-tools"
+version = "0.1.0"
+description = "PKG Counter + PDF Combiner for DENSO shipping documents (Flask web app)"
+requires-python = ">=3.11"
+dependencies = [
+    "Flask==3.0.3",
+    "pdfplumber==0.11.4",
+    "openpyxl==3.1.5",
+    "pypdf==5.9.0",
+    "gunicorn==21.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "ruff>=0.6",
+]
+
+# Current layout is still flat (app.py + combinepdf.py at the root).
+# Phase 2 of documents/UPGRADE_PLAN.md moves these into an `app/` package.
+[tool.setuptools]
+py-modules = ["app", "combinepdf"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Keep the baseline light for Phase 0. The `app.py` / `combinepdf.py` refactor
+# (UPGRADE_PLAN.md Phase 2-3) will tighten this to add "E", "B", etc.
+select = ["F", "I", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

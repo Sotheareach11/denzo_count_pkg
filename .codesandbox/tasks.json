@@ -6,10 +6,10 @@
   "tasks": {
     "start": {
       "name": "start",
-      "command": "python main.py",
+      "command": "python app.py",
       "runAtStart": true,
       "restartOn": {
-        "files": ["main.py"]
+        "files": ["app.py", "combinepdf.py"]
       }
     },
     "install-dependencies": {

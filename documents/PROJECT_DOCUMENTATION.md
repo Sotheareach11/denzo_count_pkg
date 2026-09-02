@@ -229,10 +229,16 @@ per-file log), `unclassified[]`.
 | GET | `/` | PKG Counter page |
 | POST | `/count` | Upload packing-list PDFs, start background job → `{ job_id }` |
 | GET | `/count/status/<job_id>` | Poll job progress / result |
-| GET | `/download/<report_id>` | Download the generated Excel report |
+| GET | `/download/<report_id>` | Download the generated Excel report (file is deleted from `uploads/` once the download completes fully) |
 | GET | `/combine` | Combine PDFs page |
 | POST | `/combine` | Upload INV/PL/Freight PDFs, merge → `{ download_id }` |
-| GET | `/download_combine/<download_id>` | Download the merged PDF |
+| GET | `/download_combine/<download_id>` | Download the merged PDF (file is deleted from `uploads/` once the download completes fully) |
+
+> **Download = delete.** Both download routes stream the file and then remove it
+> from `uploads/` — but only after every byte has been sent. If the download is
+> aborted or the connection drops, the file is left in place so it can be
+> retried. A file that is generated but never downloaded still lingers (that is
+> what the Phase 4 cleanup sweeper in `UPGRADE_PLAN.md` is for).
 
 ### Limits & errors
 
@@ -292,9 +298,11 @@ gunicorn app:app --workers 1 --threads 4 --timeout 180 --bind 0.0.0.0:$PORT
   silently put in the wrong invoice group or skipped. Always check the details log.
 - **Single worker only** — do not scale horizontally without moving `JOBS` to
   shared storage.
-- **`uploads/` is never garbage-collected** by the app — generated reports and
-  combined PDFs accumulate there and should be cleared periodically (ephemeral
-  hosting wipes them on restart anyway).
+- **`uploads/` is only partly self-cleaning** — a report/merged PDF is deleted
+  right after its download finishes, but files that are generated and never
+  downloaded (and the raw uploaded PDFs if a job crashes) still accumulate.
+  Clear them periodically (ephemeral hosting wipes them on restart anyway); a
+  proper retention sweeper is Phase 4 of `UPGRADE_PLAN.md`.
 - **New DENSO template?** If a packing list uses a layout none of the regexes in
   §3.3 match, its items silently won't appear. Add a new regex following the
   existing priority-ordered pattern in `parse_packing_list()`.

@@ -31,21 +31,22 @@ Two tools in this app:
                                  number and ordered INV -> PL -> Freight.
 """
 
+import gc
+import io
 import os
 import re
-import io
-import gc
-import uuid
 import shutil
 import threading
+import uuid
 from collections import OrderedDict
-from combinepdf import combine
 
-from flask import Flask, request, render_template, send_file, jsonify
 import pdfplumber
+from flask import Flask, Response, jsonify, render_template, request
 from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment, PatternFill
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+
+from combinepdf import combine
 
 app = Flask(__name__)
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
@@ -729,17 +730,60 @@ def count_status(job_id):
     return jsonify(job)
 
 
+def _download_once(file_path, download_name, mimetype):
+    """
+    Stream `file_path` to the browser as an attachment, then delete it from
+    disk - but ONLY once the whole file has been sent successfully.
+
+    The delete lives at the end of the streaming generator: if the client
+    aborts or the connection drops mid-download, the generator is closed
+    early (GeneratorExit) and the `os.remove` line is never reached, so the
+    file stays on disk and the user can retry the download. It's removed
+    only when every byte has gone out.
+
+    Returns None if the file doesn't exist (caller sends the 404).
+    """
+    if not os.path.isfile(file_path):
+        return None
+
+    file_size = os.path.getsize(file_path)
+
+    def generate():
+        sent = 0
+        with open(file_path, "rb") as fh:
+            while True:
+                chunk = fh.read(64 * 1024)
+                if not chunk:
+                    break
+                sent += len(chunk)
+                yield chunk
+        # Reached only on a clean, complete read - not on an aborted download.
+        if sent == file_size:
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+
+    resp = Response(generate(), mimetype=mimetype)
+    resp.headers["Content-Length"] = str(file_size)
+    resp.headers["Content-Disposition"] = (
+        f'attachment; filename="{download_name}"'
+    )
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.route("/download/<report_id>")
 def download(report_id):
     report_path = os.path.join(UPLOAD_DIR, f"{report_id}.xlsx")
-    if not os.path.isfile(report_path):
-        return "Report not found or expired.", 404
-    return send_file(
+    resp = _download_once(
         report_path,
-        as_attachment=True,
-        download_name="PKG_Count_Report.xlsx",
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "PKG_Count_Report.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+    if resp is None:
+        return "Report not found or expired.", 404
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -786,14 +830,10 @@ def combine_pdfs_route():
 @app.route("/download_combine/<download_id>")
 def download_combine(download_id):
     file_path = os.path.join(UPLOAD_DIR, f"{download_id}.pdf")
-    if not os.path.isfile(file_path):
+    resp = _download_once(file_path, "combined_output.pdf", "application/pdf")
+    if resp is None:
         return "File not found or expired.", 404
-    return send_file(
-        file_path,
-        as_attachment=True,
-        download_name="combined_output.pdf",
-        mimetype="application/pdf",
-    )
+    return resp
 
 
 if __name__ == "__main__":

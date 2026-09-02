@@ -1,0 +1,5 @@
+# Development tooling. Installs runtime deps too.
+-r requirements.txt
+
+pytest>=8,<9
+ruff>=0.6

@@ -25,7 +25,8 @@ Or imported:
 import os
 import re
 import sys
-from pypdf import PdfWriter, PdfReader
+
+from pypdf import PdfReader, PdfWriter
 
 TYPE_ORDER = {"INV": 0, "PL": 1, "FREIGHT": 2}
 TYPE_LABEL = {"INV": "Invoice", "PL": "Packing List", "FREIGHT": "Freight"}
