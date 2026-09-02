@@ -146,6 +146,18 @@
 
       <button id="countBtn" disabled>Count PKG</button>
       <div id="status"></div>
+      <div
+        id="summaryBox"
+        style="
+          display: none;
+          margin-top: 14px;
+          padding: 14px 16px;
+          background: #eef3fb;
+          border: 1px solid #c9d6ec;
+          border-radius: 8px;
+          font-size: 14px;
+        "
+      ></div>
       <a id="downloadBtn" href="#">⬇ Download Excel Report</a>
 
       <div id="results"></div>
@@ -175,6 +187,76 @@
         resultsDiv.innerHTML = "";
       });
 
+      const summaryBox = document.getElementById("summaryBox");
+
+      function describeHttpError(res, raw, data) {
+        if (data && data.error) return data.error;
+        if (res.status === 502 || res.status === 504) {
+          return "The server took too long or ran out of memory. Try again, or check with the site owner if this keeps happening.";
+        }
+        if (res.status === 413) {
+          return "Upload too large for one batch.";
+        }
+        if (!raw) {
+          return `Server returned an empty response (status ${res.status}). It may have crashed or restarted.`;
+        }
+        return `Unexpected server response (status ${res.status}).`;
+      }
+
+      async function readJsonSafe(res) {
+        const raw = await res.text();
+        let data = null;
+        if (raw) {
+          try {
+            data = JSON.parse(raw);
+          } catch (e) {
+            data = null;
+          }
+        }
+        return { raw, data };
+      }
+
+      function sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+      }
+
+      async function pollJob(jobId) {
+        // Poll every 2 seconds until the background job finishes, fails,
+        // or we lose track of it. Each poll is a small, fast request, so
+        // none of them can hit a timeout the way one giant upload request
+        // did.
+        while (true) {
+          await sleep(2000);
+          const res = await fetch(`/count/status/${jobId}`);
+          const { raw, data } = await readJsonSafe(res);
+
+          if (!res.ok || !data) {
+            throw new Error(describeHttpError(res, raw, data));
+          }
+
+          if (data.status === "processing" || data.status === "queued") {
+            const done = data.progress_done || 0;
+            const total = data.progress_total || 0;
+            const currentFile = data.current_file
+              ? ` (${data.current_file})`
+              : "";
+            statusDiv.textContent =
+              total > 0
+                ? `Processing ${done}/${total}${currentFile}...`
+                : "Processing...";
+            continue;
+          }
+
+          if (data.status === "error") {
+            throw new Error(data.error || "Processing failed.");
+          }
+
+          if (data.status === "done") {
+            return data;
+          }
+        }
+      }
+
       countBtn.addEventListener("click", async () => {
         const files = pdfInput.files;
         if (!files.length) return;
@@ -183,52 +265,45 @@
         for (const f of files) formData.append("pdfs", f);
 
         countBtn.disabled = true;
-        statusDiv.textContent = "Processing...";
+        statusDiv.textContent = "Uploading...";
         resultsDiv.innerHTML = "";
+        summaryBox.style.display = "none";
         downloadBtn.style.display = "none";
 
         try {
-          const res = await fetch("/count", { method: "POST", body: formData });
+          // This first request just saves the files and starts a
+          // background job - it returns almost immediately, so it won't
+          // hit the same timeout that processing a huge batch inline did.
+          const startRes = await fetch("/count", {
+            method: "POST",
+            body: formData,
+          });
+          const { raw, data: startData } = await readJsonSafe(startRes);
 
-          // Read as text first - if the server crashed, timed out, or Render's
-          // proxy returned an error page, the body may be empty or HTML, and
-          // res.json() would throw a confusing "Unexpected end of JSON input".
-          const raw = await res.text();
-          let data = null;
-          if (raw) {
-            try {
-              data = JSON.parse(raw);
-            } catch (parseErr) {
-              data = null;
-            }
+          if (!startRes.ok || !startData) {
+            throw new Error(describeHttpError(startRes, raw, startData));
           }
 
-          if (!res.ok || !data) {
-            let message;
-            if (data && data.error) {
-              message = data.error;
-            } else if (res.status === 502 || res.status === 504) {
-              message =
-                "The server took too long or ran out of memory processing " +
-                "these files. Try uploading fewer PDFs at once.";
-            } else if (res.status === 413) {
-              message = "Upload too large. Try uploading fewer PDFs at once.";
-            } else if (!raw) {
-              message =
-                `Server returned an empty response (status ${res.status}). ` +
-                "This usually means it crashed or timed out - try fewer files.";
-            } else {
-              message = `Unexpected server response (status ${res.status}).`;
-            }
-            statusDiv.textContent = "Error: " + message;
-            countBtn.disabled = false;
-            return;
-          }
+          statusDiv.textContent = `Processing 0/${startData.total_files}...`;
+          const data = await pollJob(startData.job_id);
 
           statusDiv.textContent = "Done!";
+
+          summaryBox.innerHTML =
+            `<strong>Totals across all files:</strong><br/>` +
+            `PKG: ${data.grand_total_pkg} &nbsp;|&nbsp; ` +
+            `Net Weight: ${data.grand_total_nw} kg &nbsp;|&nbsp; ` +
+            `Gross Weight: ${data.grand_total_gw} kg`;
+          summaryBox.style.display = "block";
+
           data.preview.forEach((pdf) => {
             const block = document.createElement("div");
             block.className = "pdf-block";
+            if (pdf.error) {
+              block.innerHTML = `<h3>${pdf.filename}</h3><p style="color:#b91c1c;">Could not process: ${pdf.error}</p>`;
+              resultsDiv.appendChild(block);
+              return;
+            }
             let html = `<h3>${pdf.filename}</h3><table><tr><th>Item No.</th><th>Description</th><th>PKG (Count)</th><th>Total Qty</th></tr>`;
             pdf.items.forEach((item) => {
               html += `<tr><td>${item.itemno}</td><td>${item.desc}</td><td>${item.pkg}</td><td>${item.qty}</td></tr>`;

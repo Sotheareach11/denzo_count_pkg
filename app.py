@@ -37,6 +37,7 @@ import io
 import gc
 import uuid
 import shutil
+import threading
 from collections import OrderedDict
 from combinepdf import combine
 
@@ -70,6 +71,119 @@ def too_large(e):
                  f"{MAX_UPLOAD_MB}MB of PDFs at a time (try fewer files "
                  f"or split into batches)."
     }), 413
+
+
+# ---------------------------------------------------------------------------
+# BACKGROUND JOB STORE (PKG Counter)
+# ---------------------------------------------------------------------------
+# Large batches of PDFs can take longer to process than Render's/gunicorn's
+# request timeout allows. Rather than making the browser hold one huge HTTP
+# request open the whole time (which is what was timing out), /count now
+# returns almost immediately with a job_id, a background thread does the
+# actual parsing, and the browser polls /count/status/<job_id> for progress.
+#
+# JOBS is a plain in-memory dict. This is fine as long as the app runs as a
+# single gunicorn worker (see the Start Command note above) - if you ever
+# scale to multiple workers/instances, move this to Redis or a database so
+# all workers can see the same job state.
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+
+
+def _set_job(job_id, **kwargs):
+    with JOBS_LOCK:
+        JOBS[job_id].update(kwargs)
+
+
+def _process_count_job(job_id, saved_files):
+    """
+    Runs in a background thread. saved_files is a list of
+    (temp_path, original_filename) tuples already written to disk by the
+    /count route (so the HTTP request itself can return immediately).
+    """
+    all_results = []
+    preview = []
+    total = len(saved_files)
+
+    try:
+        for idx, (temp_path, filename) in enumerate(saved_files, start=1):
+            _set_job(job_id, status="processing",
+                     progress_done=idx - 1, progress_total=total,
+                     current_file=filename)
+            try:
+                records, packages, ship_to = parse_packing_list(temp_path)
+                summary, package_names = summarize_by_name(records)
+                all_results.append(
+                    (filename, summary, packages, package_names, ship_to))
+
+                total_nw = sum(p["nw"] for p in packages.values())
+                total_gw = sum(p["gw"] for p in packages.values())
+
+                preview.append({
+                    "filename": filename,
+                    "ship_to": ship_to,
+                    "items": [
+                        {"itemno": r["itemno"],
+                            "desc": display_name(r["custitem"], r["desc"]),
+                            "pkg": r["count"], "qty": r["total_qty"]}
+                        for r in summary
+                    ],
+                    "packages": [
+                        {"cml": p["cml"], "name": package_names.get(p["cml"], ""),
+                         "nw": p["nw"], "gw": p["gw"]}
+                        for p in packages.values()
+                    ],
+                    "total_pkg": len(packages),
+                    "total_nw": round(total_nw, 3),
+                    "total_gw": round(total_gw, 3),
+                })
+                del records
+            except Exception as file_err:
+                # Don't let one bad/unreadable PDF kill the whole batch -
+                # record it and keep going.
+                preview.append({
+                    "filename": filename,
+                    "error": str(file_err),
+                })
+            finally:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+                # Release pdfplumber's internal buffers for this file
+                # before moving on, so memory doesn't climb across a big
+                # batch.
+                gc.collect()
+
+        _set_job(job_id, progress_done=total)
+
+        if not all_results:
+            _set_job(job_id, status="error",
+                     error="No valid PDF data extracted.")
+            return
+
+        # Grand totals across every file, for the headline summary.
+        grand_pkg = sum(r["total_pkg"] for r in preview if "total_pkg" in r)
+        grand_nw = sum(r["total_nw"] for r in preview if "total_nw" in r)
+        grand_gw = sum(r["total_gw"] for r in preview if "total_gw" in r)
+
+        excel_buffer = build_excel(all_results)
+        report_id = uuid.uuid4().hex
+        report_path = os.path.join(UPLOAD_DIR, f"{report_id}.xlsx")
+        with open(report_path, "wb") as out:
+            out.write(excel_buffer.getvalue())
+
+        _set_job(
+            job_id,
+            status="done",
+            preview=preview,
+            download_id=report_id,
+            grand_total_pkg=grand_pkg,
+            grand_total_nw=round(grand_nw, 3),
+            grand_total_gw=round(grand_gw, 3),
+        )
+    except Exception as e:
+        _set_job(job_id, status="error", error=str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -574,65 +688,45 @@ def count_pkg():
     if not files or files[0].filename == "":
         return jsonify({"error": "No files uploaded."}), 400
 
-    all_results = []
-    preview = []
-
+    # Save every uploaded PDF to disk right away - this is fast (no parsing
+    # yet), so the HTTP request can return almost instantly instead of
+    # staying open for however long parsing the whole batch takes.
+    saved_files = []
     for f in files:
         if not f.filename.lower().endswith(".pdf"):
             continue
         temp_path = os.path.join(
             UPLOAD_DIR, f"{uuid.uuid4().hex}_{f.filename}")
         f.save(temp_path)
-        try:
-            records, packages, ship_to = parse_packing_list(temp_path)
-            summary, package_names = summarize_by_name(records)
-            all_results.append(
-                (f.filename, summary, packages, package_names, ship_to))
+        saved_files.append((temp_path, f.filename))
 
-            total_nw = sum(p["nw"] for p in packages.values())
-            total_gw = sum(p["gw"] for p in packages.values())
+    if not saved_files:
+        return jsonify({"error": "No valid PDF files uploaded."}), 400
 
-            preview.append({
-                "filename": f.filename,
-                "ship_to": ship_to,
-                "items": [
-                    {"itemno": r["itemno"],
-                        "desc": display_name(r["custitem"], r["desc"]),
-                        "pkg": r["count"], "qty": r["total_qty"]}
-                    for r in summary
-                ],
-                "packages": [
-                    {"cml": p["cml"], "name": package_names.get(p["cml"], ""),
-                     "nw": p["nw"], "gw": p["gw"]}
-                    for p in packages.values()
-                ],
-                "total_pkg": len(packages),
-                "total_nw": round(total_nw, 3),
-                "total_gw": round(total_gw, 3),
-            })
+    job_id = uuid.uuid4().hex
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "status": "queued",
+            "progress_done": 0,
+            "progress_total": len(saved_files),
+            "current_file": None,
+        }
 
-            # `records` can be sizeable for big packing lists and is only
-            # needed transiently to build `summary` above - drop it now
-            # rather than letting it ride along for the rest of the batch.
-            del records
-        finally:
-            os.remove(temp_path)
-            # Release pdfplumber's internal buffers for this file before
-            # moving on to the next one, so memory doesn't climb steadily
-            # across a large batch of PDFs.
-            gc.collect()
+    thread = threading.Thread(
+        target=_process_count_job, args=(job_id, saved_files), daemon=True)
+    thread.start()
 
-    if not all_results:
-        return jsonify({"error": "No valid PDF data extracted."}), 400
+    return jsonify({"job_id": job_id, "total_files": len(saved_files)})
 
-    excel_buffer = build_excel(all_results)
 
-    report_id = uuid.uuid4().hex
-    report_path = os.path.join(UPLOAD_DIR, f"{report_id}.xlsx")
-    with open(report_path, "wb") as out:
-        out.write(excel_buffer.getvalue())
-
-    return jsonify({"preview": preview, "download_id": report_id})
+@app.route("/count/status/<job_id>")
+def count_status(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if job is None:
+        return jsonify({"error": "Unknown job ID."}), 404
+    # Return a plain copy so we're not holding the lock while jsonify runs.
+    return jsonify(job)
 
 
 @app.route("/download/<report_id>")
