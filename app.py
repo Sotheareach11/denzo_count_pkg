@@ -1,17 +1,17 @@
 """
 PKG Counter + Combine PDFs - Web App (Flask)
 =============================================
-Runs in the browser - works great on CodeSandbox, Replit, or any
+Runs in the browser - works great on CodeSandbox, Replit, Render, or any
 container with no display (no tkinter needed).
 
 Install:
-    pip install flask pdfplumber openpyxl pypdf
+    pip install flask pdfplumber openpyxl pypdf gunicorn
 
-Run:
+Run locally:
     python app.py
 
-Then open the preview URL CodeSandbox gives you (or http://localhost:8080
-if running locally).
+Run in production (Render Start Command):
+    gunicorn app:app --workers 2 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
 
 Two tools in this app:
   1. PKG Counter ("/")        - upload packing list PDFs, get an Excel
@@ -42,9 +42,30 @@ app = Flask(__name__)
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+# ---------------------------------------------------------------------------
+# PRODUCTION / RENDER SETTINGS
+# ---------------------------------------------------------------------------
+
+# Cap total request size (all uploaded files combined) so a huge batch of
+# PDFs can't exhaust memory or blow past Render's proxy limits. Adjust the
+# number (in MB) to whatever your plan's RAM comfortably allows.
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "75"))
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+
+
+@app.errorhandler(413)
+def too_large(e):
+    """Return a clean JSON error instead of a raw connection failure when
+    the upload exceeds MAX_CONTENT_LENGTH."""
+    return jsonify({
+        "error": f"Upload too large. Please upload no more than "
+                 f"{MAX_UPLOAD_MB}MB of PDFs at a time (try fewer files "
+                 f"or split into batches)."
+    }), 413
+
 
 # ---------------------------------------------------------------------------
-# PDF PARSING (PKG Counter) 111
+# PDF PARSING (PKG Counter)
 # ---------------------------------------------------------------------------
 
 # CML No.   Volume(m3)   Net Weight(kg)   Gross Weight(kg)
@@ -660,4 +681,7 @@ def download_combine(download_id):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=True)
+    # Local dev only - Render runs this via gunicorn instead (see Start
+    # Command in the docstring at the top of this file), so debug=True here
+    # never reaches production.
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), debug=True)
