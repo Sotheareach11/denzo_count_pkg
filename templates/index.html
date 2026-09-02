@@ -189,11 +189,38 @@
 
         try {
           const res = await fetch("/count", { method: "POST", body: formData });
-          const data = await res.json();
 
-          if (!res.ok) {
-            statusDiv.textContent =
-              "Error: " + (data.error || "Something went wrong.");
+          // Read as text first - if the server crashed, timed out, or Render's
+          // proxy returned an error page, the body may be empty or HTML, and
+          // res.json() would throw a confusing "Unexpected end of JSON input".
+          const raw = await res.text();
+          let data = null;
+          if (raw) {
+            try {
+              data = JSON.parse(raw);
+            } catch (parseErr) {
+              data = null;
+            }
+          }
+
+          if (!res.ok || !data) {
+            let message;
+            if (data && data.error) {
+              message = data.error;
+            } else if (res.status === 502 || res.status === 504) {
+              message =
+                "The server took too long or ran out of memory processing " +
+                "these files. Try uploading fewer PDFs at once.";
+            } else if (res.status === 413) {
+              message = "Upload too large. Try uploading fewer PDFs at once.";
+            } else if (!raw) {
+              message =
+                `Server returned an empty response (status ${res.status}). ` +
+                "This usually means it crashed or timed out - try fewer files.";
+            } else {
+              message = `Unexpected server response (status ${res.status}).`;
+            }
+            statusDiv.textContent = "Error: " + message;
             countBtn.disabled = false;
             return;
           }
