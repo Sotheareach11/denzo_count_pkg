@@ -21,11 +21,26 @@ Run in production (Render Start Command):
     memory multiplication.
 
 Two tools in this app:
-  1. PKG Counter ("/")        - upload packing list PDFs, get an Excel
-                                 report of PKG counts. The "PKG Summary"
-                                 sheet is grouped first by Ship To
-                                 (factory) detected in each PDF, then by
-                                 invoice within each factory.
+  1. PKG Counter ("/")        - upload packing list (PKL) PDFs and/or
+                                 invoice (INV) PDFs together in one batch.
+                                 Each file is auto-detected by type. PKL
+                                 files are parsed exactly as before (CML
+                                 No. / PKG / weight breakdown). When a PKL
+                                 and an INV are for the SAME shipment
+                                 (matched by the Invoice No. printed on
+                                 each PDF, falling back to the numeric ID
+                                 in the filename if a PKL doesn't have
+                                 that field), they're merged into ONE
+                                 sheet: the normal packing-list sheet, with
+                                 a Unit Price / Amount column added per
+                                 item from the matching invoice. If an INV
+                                 has no matching PKL, it still gets its own
+                                 sheet so nothing is lost. The "PKG
+                                 Summary" sheet is likewise one row-set per
+                                 shipment (not duplicated per file),
+                                 grouped by Ship To (factory), with an
+                                 Amount (USD) column carrying each
+                                 shipment's total invoiced value.
   2. Combine PDFs ("/combine") - upload INV / PL / Freight PDFs, get them
                                  merged into one PDF, grouped by invoice
                                  number and ordered INV -> PL -> Freight.
@@ -100,9 +115,19 @@ def _process_count_job(job_id, saved_files):
     Runs in a background thread. saved_files is a list of
     (temp_path, original_filename) tuples already written to disk by the
     /count route (so the HTTP request itself can return immediately).
+
+    Two-phase processing:
+      1. Parse every file individually (PKL or INV, auto-detected) into a
+         lightweight "parsed" dict - this never fails because two files
+         are related to each other, only because a single file is
+         unreadable.
+      2. build_merged_entries() groups those parsed files by shipment
+         (Invoice No., or a fallback ID from the filename) and merges any
+         matching PKL + INV pair into one entry before Excel/preview
+         building happens.
     """
-    all_results = []
-    preview = []
+    parsed_files = []
+    preview_errors = {}
     total = len(saved_files)
 
     try:
@@ -111,40 +136,33 @@ def _process_count_job(job_id, saved_files):
                      progress_done=idx - 1, progress_total=total,
                      current_file=filename)
             try:
-                records, packages, ship_to = parse_packing_list(temp_path)
-                summary, package_names = summarize_by_name(records)
-                all_results.append(
-                    (filename, summary, packages, package_names, ship_to))
-
-                total_nw = sum(p["nw"] for p in packages.values())
-                total_gw = sum(p["gw"] for p in packages.values())
-
-                preview.append({
-                    "filename": filename,
-                    "ship_to": ship_to,
-                    "items": [
-                        {"itemno": r["itemno"],
-                            "desc": display_name(r["custitem"], r["desc"]),
-                            "pkg": r["count"], "qty": r["total_qty"]}
-                        for r in summary
-                    ],
-                    "packages": [
-                        {"cml": p["cml"], "name": package_names.get(p["cml"], ""),
-                         "nw": p["nw"], "gw": p["gw"]}
-                        for p in packages.values()
-                    ],
-                    "total_pkg": len(packages),
-                    "total_nw": round(total_nw, 3),
-                    "total_gw": round(total_gw, 3),
-                })
-                del records
+                doc_type = detect_doc_type(temp_path)
+                if doc_type == "invoice":
+                    records, header = parse_invoice(temp_path)
+                    parsed_files.append({
+                        "type": "invoice",
+                        "filename": filename,
+                        "ship_to": header["ship_to"],
+                        "invoice_no": header["invoice_no"],
+                        "records": records,
+                    })
+                else:
+                    records, packages, ship_to, invoice_no = parse_packing_list(
+                        temp_path)
+                    summary, package_names = summarize_by_name(records)
+                    parsed_files.append({
+                        "type": "packing_list",
+                        "filename": filename,
+                        "ship_to": ship_to,
+                        "invoice_no": invoice_no,
+                        "summary": summary,
+                        "packages": packages,
+                        "package_names": package_names,
+                    })
             except Exception as file_err:
                 # Don't let one bad/unreadable PDF kill the whole batch -
                 # record it and keep going.
-                preview.append({
-                    "filename": filename,
-                    "error": str(file_err),
-                })
+                preview_errors[filename] = str(file_err)
             finally:
                 try:
                     os.remove(temp_path)
@@ -157,15 +175,52 @@ def _process_count_job(job_id, saved_files):
 
         _set_job(job_id, progress_done=total)
 
-        if not all_results:
+        all_results = build_merged_entries(parsed_files)
+
+        if not all_results and not preview_errors:
             _set_job(job_id, status="error",
                      error="No valid PDF data extracted.")
             return
 
-        # Grand totals across every file, for the headline summary.
-        grand_pkg = sum(r["total_pkg"] for r in preview if "total_pkg" in r)
-        grand_nw = sum(r["total_nw"] for r in preview if "total_nw" in r)
-        grand_gw = sum(r["total_gw"] for r in preview if "total_gw" in r)
+        preview = []
+        for filename, err in preview_errors.items():
+            preview.append({"filename": filename, "error": err})
+
+        grand_pkg = 0
+        grand_nw = 0.0
+        grand_gw = 0.0
+        grand_amount = 0.0
+
+        for filename, summary, packages, package_names, ship_to, invoice_amount in all_results:
+            total_nw = sum(p["nw"] for p in packages.values())
+            total_gw = sum(p["gw"] for p in packages.values())
+
+            preview.append({
+                "filename": filename,
+                "ship_to": ship_to,
+                "items": [
+                    {"itemno": r["itemno"],
+                        "desc": display_name(r["custitem"], r["desc"]),
+                        "pkg": r["count"], "qty": r["total_qty"],
+                        "unit_price": r.get("unit_price", ""),
+                        "amount": r.get("amount", "")}
+                    for r in summary
+                ],
+                "packages": [
+                    {"cml": p["cml"], "name": package_names.get(key, ""),
+                     "nw": p["nw"], "gw": p["gw"]}
+                    for key, p in packages.items()
+                ],
+                "total_pkg": len(packages),
+                "total_nw": round(total_nw, 3),
+                "total_gw": round(total_gw, 3),
+                "total_amount": round(invoice_amount, 2),
+            })
+
+            grand_pkg += len(packages)
+            grand_nw += total_nw
+            grand_gw += total_gw
+            grand_amount += invoice_amount
 
         excel_buffer = build_excel(all_results)
         report_id = uuid.uuid4().hex
@@ -181,13 +236,14 @@ def _process_count_job(job_id, saved_files):
             grand_total_pkg=grand_pkg,
             grand_total_nw=round(grand_nw, 3),
             grand_total_gw=round(grand_gw, 3),
+            grand_total_amount=round(grand_amount, 2),
         )
     except Exception as e:
         _set_job(job_id, status="error", error=str(e))
 
 
 # ---------------------------------------------------------------------------
-# PDF PARSING (PKG Counter)
+# PDF PARSING (PKG Counter) - Packing List template
 # ---------------------------------------------------------------------------
 
 # CML No.   Volume(m3)   Net Weight(kg)   Gross Weight(kg)
@@ -249,14 +305,21 @@ HEADER_PREFIXES = (
 SHIP_TO_MARKER_RE = re.compile(r'Ship\s*to', re.IGNORECASE)
 COMPANY_HINT_RE = re.compile(r'CO\.,?\s*LTD', re.IGNORECASE)
 
+# "Invoice No." line on the cover page - present on both packing lists and
+# invoices in this document family, and is the primary key used to match a
+# PKL to its INV. Anchored to line-start so it doesn't match "Ref Invoice
+# No." (which has no value on the same line in these templates anyway).
+INVOICE_NO_RE = re.compile(r'^Invoice No\.\s*(\S+)')
+
 
 def extract_ship_to(first_page_text):
     """
     Detects the "Ship to" company / factory name from the raw text of a
-    packing list's first page.
+    packing list's (or invoice's) first page.
 
-    pdfplumber often merges the "Sold to" and "Ship to" table columns onto
-    the same line (since they sit at the same y-position in the PDF), e.g.:
+    pdfplumber often merges the "Sold to"/"Consignee" and "Ship to" table
+    columns onto the same line (since they sit at the same y-position in
+    the PDF), e.g.:
 
         Ship to Document Information DENSO (THAILAND) CO., LTD.
         DENSO (THAILAND) CO., LTD. Document Type NORMAL ...
@@ -289,26 +352,44 @@ def extract_ship_to(first_page_text):
     return "Unknown"
 
 
+def extract_invoice_no(first_page_text):
+    """Finds the "Invoice No." value on a cover page. Works the same way
+    for both packing lists and invoices, since both carry this field."""
+    for raw_line in first_page_text.split("\n"):
+        m = INVOICE_NO_RE.match(raw_line.strip())
+        if m:
+            return m.group(1)
+    return "Unknown"
+
+
 def parse_packing_list(pdf_path):
     """
-    Returns (records, packages, ship_to)
+    Parses a packing list PDF exactly as before (CML No. / PKG / weight
+    breakdown) - the only addition is also reading the "Invoice No." off
+    the cover page, so this shipment can be matched to its invoice later.
 
-    records  - one dict per order line (used for the item summary sheet).
-               Always has both "custitem" and "desc" filled in as best as
-               possible (desc may be "" if truly not found anywhere).
-    packages - OrderedDict keyed by CML No., each value:
-               {"cml": ..., "vol": float, "nw": float, "gw": float}
-               (used for the combined PKG weight sheet)
-    ship_to  - detected Ship To company / factory name (string), used to
-               group the PKG Summary sheet by factory.
+    Returns (records, packages, ship_to, invoice_no)
+
+    records    - one dict per order line (used for the item summary sheet).
+                 Always has both "custitem" and "desc" filled in as best
+                 as possible (desc may be "" if truly not found anywhere).
+    packages   - OrderedDict keyed by CML No., each value:
+                 {"cml": ..., "vol": float, "nw": float, "gw": float}
+                 (used for the combined PKG weight sheet)
+    ship_to    - detected Ship To company / factory name (string), used
+                 to group the PKG Summary sheet by factory.
+    invoice_no - detected Invoice No. (string, "Unknown" if not found),
+                 used to match this packing list to its invoice.
     """
     lines = []
     ship_to = "Unknown"
+    invoice_no = "Unknown"
     with pdfplumber.open(pdf_path) as pdf:
         for page_idx, page in enumerate(pdf.pages):
             text = page.extract_text() or ""
             if page_idx == 0:
                 ship_to = extract_ship_to(text)
+                invoice_no = extract_invoice_no(text)
             for raw_line in text.split("\n"):
                 line = raw_line.strip()
                 if not line:
@@ -443,7 +524,7 @@ def parse_packing_list(pdf_path):
 
         i += 1
 
-    return records, packages, ship_to
+    return records, packages, ship_to, invoice_no
 
 
 def display_name(custitem, desc):
@@ -492,6 +573,303 @@ def summarize_by_name(records):
 
 
 # ---------------------------------------------------------------------------
+# PDF PARSING (PKG Counter) - Invoice (INV) template
+# ---------------------------------------------------------------------------
+#
+# DENSO-style invoices consist of:
+#   - a cover page with Invoice No., Ship to, No. of PKG, Net/Gross Weight,
+#     Volume, and a Total Amount (Net Amount + Freight + Insurance).
+#   - one or more "INVOICE ATTACHED SHEET" pages listing line items, each
+#     spread across a fixed 3-line group as pdfplumber extracts it:
+#       Row A: "<Customer Order No. or Model>  <Customer Item No. or dims>  <Country>"
+#       Row B: "<Description>  <Currency>"
+#       Row C: "[Item No.]  <Unit>  <Qty>  <Unit Price>  <Amount>"
+#     (Item No. on Row C is only present in some templates - when it's
+#     missing, the first token of Row A doubles as the item code, mirroring
+#     the same kind of "data lives in a different column depending on
+#     template" fallback used in the packing-list parser above.)
+
+# Lines to ignore on "INVOICE ATTACHED SHEET" pages - table headers,
+# pagination, and the trailing "Total QTY ... Total Amount ..." line.
+INVOICE_LINE_SKIP_PREFIXES = (
+    "Page", "INVOICE ATTACHED SHEET", "Invoice No.", "Customer Order No.",
+    "No.", "Description", "Model", "Item No.", "Total QTY",
+)
+
+# Row C: optional Item No., then Unit (letters only) Qty UnitPrice Amount.
+# Anchored start-to-end so it can't accidentally match a header/footer line
+# that happens to contain some of these tokens.
+ITEM_PRICE_RE = re.compile(
+    r'^(?:(?P<itemno>\S+)\s+)?(?P<unit>[A-Za-z]+)\s+(?P<qty>[\d,]+)\s+'
+    r'(?P<unitprice>[\d.,]+)\s+(?P<amount>[\d.,]+)$'
+)
+
+PKG_COUNT_RE = re.compile(r'No\. of PKG\s+(\d+)')
+NET_WEIGHT_RE = re.compile(r'Net Weight\s*\(kg\)\s+([\d,.]+)')
+GROSS_WEIGHT_RE = re.compile(r'Gross Weight\s*\(kg\)\s+([\d,.]+)')
+VOLUME_RE = re.compile(r'Volume\s*\(m3\)\s+([\d,.]+)')
+# The cover page's own Total Amount line, e.g. "Total Amount USD 1,035.90".
+# Anchored to the start of the line so it never matches the "Total QTY ...
+# Total Amount ..." footer line on the attached-sheet pages.
+TOTAL_AMOUNT_RE = re.compile(
+    r'^Total Amount\s+(?P<cur>[A-Z]{3})\s+(?P<amt>[\d,.]+)$')
+
+
+def detect_doc_type(pdf_path):
+    """
+    Cheap check of a PDF's first couple of pages to decide which parser to
+    use. Packing lists have a "CML No." column (per-pallet weight
+    breakdown); invoices don't have that, but do have "Unit Price" /
+    "Total Amount". Falls back to "packing_list" (the original, default
+    behaviour of this app) if neither marker is clearly detected.
+    """
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            sample_text = ""
+            for page in pdf.pages[:2]:
+                sample_text += (page.extract_text() or "") + "\n"
+                page.flush_cache()
+    except Exception:
+        return "packing_list"
+
+    if "CML No." in sample_text:
+        return "packing_list"
+    if "Unit Price" in sample_text and "Total Amount" in sample_text:
+        return "invoice"
+    return "packing_list"
+
+
+def parse_invoice(pdf_path):
+    """
+    Parses a DENSO-style INVOICE PDF.
+
+    Returns (records, header):
+      records - one dict per line item:
+                {itemno, order, custitem, desc, country, unit, qty,
+                 unit_price, amount}
+      header  - {invoice_no, ship_to, pkg_count, net_weight, gross_weight,
+                 volume, currency, total_amount}
+    """
+    header = {
+        "invoice_no": "Unknown", "ship_to": "Unknown", "pkg_count": 0,
+        "net_weight": 0.0, "gross_weight": 0.0, "volume": 0.0,
+        "currency": "USD", "total_amount": 0.0,
+    }
+    item_lines = []
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_idx, page in enumerate(pdf.pages):
+            text = page.extract_text() or ""
+
+            if page_idx == 0:
+                header["ship_to"] = extract_ship_to(text)
+                header["invoice_no"] = extract_invoice_no(text)
+                for raw_line in text.split("\n"):
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+
+                    m = PKG_COUNT_RE.search(line)
+                    if m:
+                        header["pkg_count"] = int(m.group(1))
+                        continue
+                    m = NET_WEIGHT_RE.search(line)
+                    if m:
+                        header["net_weight"] = float(
+                            m.group(1).replace(",", ""))
+                        continue
+                    m = GROSS_WEIGHT_RE.search(line)
+                    if m:
+                        header["gross_weight"] = float(
+                            m.group(1).replace(",", ""))
+                        continue
+                    m = VOLUME_RE.search(line)
+                    if m:
+                        header["volume"] = float(m.group(1).replace(",", ""))
+                        continue
+                    m = TOTAL_AMOUNT_RE.match(line)
+                    if m:
+                        header["currency"] = m.group("cur")
+                        header["total_amount"] = float(
+                            m.group("amt").replace(",", ""))
+                        continue
+            else:
+                for raw_line in text.split("\n"):
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    if line.startswith(INVOICE_LINE_SKIP_PREFIXES):
+                        continue
+                    item_lines.append(line)
+
+            page.flush_cache()
+
+    records = []
+    # Item rows come in fixed triples: [order/model + country],
+    # [description + currency], [itemno? + unit + qty + unit price + amount]
+    for i in range(0, len(item_lines) - 2, 3):
+        row_a, row_b, row_c = item_lines[i], item_lines[i + 1], item_lines[i + 2]
+
+        m = ITEM_PRICE_RE.match(row_c)
+        if not m:
+            # Layout didn't match what we expected for this triple - skip
+            # it rather than mis-attributing numbers to the wrong item.
+            continue
+
+        a_tokens = row_a.rsplit(" ", 1)
+        country = a_tokens[1] if len(a_tokens) == 2 else ""
+        a_rest = a_tokens[0] if len(a_tokens) == 2 else row_a
+        a_parts = a_rest.split(None, 1)
+        order = a_parts[0] if a_parts else ""
+        custitem = a_parts[1] if len(a_parts) > 1 else ""
+
+        b_tokens = row_b.rsplit(" ", 1)
+        desc = b_tokens[0] if len(b_tokens) == 2 else row_b
+
+        # Some templates leave Item No. blank on Row C - in that case the
+        # first token of Row A (e.g. a Model code like "N60T") is the item
+        # identifier instead.
+        itemno = m.group("itemno") or order
+
+        records.append({
+            "itemno": itemno,
+            "order": order,
+            "custitem": custitem,
+            "desc": desc.strip(),
+            "country": country,
+            "unit": m.group("unit"),
+            "qty": int(m.group("qty").replace(",", "")),
+            "unit_price": float(m.group("unitprice").replace(",", "")),
+            "amount": float(m.group("amount").replace(",", "")),
+        })
+
+    return records, header
+
+
+# ---------------------------------------------------------------------------
+# MATCHING - combine a packing list and its invoice into one entry
+# ---------------------------------------------------------------------------
+
+# Fallback shipment ID when a PDF's "Invoice No." field can't be found: the
+# longest run of 5+ digits in the filename. DENSO's own naming convention
+# (e.g. "INV_TG0_651599_20260813094815.pdf") embeds the invoice number
+# there too, so this still lets a PKL and INV match up even if one
+# template doesn't carry an explicit "Invoice No." line.
+FILENAME_ID_RE = re.compile(r'(\d{5,})')
+
+
+def _shipment_key(parsed_file):
+    invoice_no = parsed_file.get("invoice_no")
+    if invoice_no and invoice_no != "Unknown":
+        return f'inv:{invoice_no}'
+    m = FILENAME_ID_RE.search(parsed_file["filename"])
+    if m:
+        return f'fname:{m.group(1)}'
+    return f'file:{id(parsed_file)}'
+
+
+def summarize_invoice_only(records):
+    """
+    Builds the same (rows, packages, package_names) shape used for packing
+    lists, for an invoice that has no matching PKL - so nothing is lost,
+    it just gets its own sheet instead of being merged into one. Each line
+    item becomes one row/one pseudo-"package" (vol/nw/gw left at 0, since
+    an invoice alone doesn't report per-item weight), carrying its own
+    Unit Price / Amount.
+    """
+    rows = []
+    packages = OrderedDict()
+    package_names = OrderedDict()
+
+    for idx, r in enumerate(records):
+        rows.append({
+            "itemno": r["itemno"], "custitem": r["custitem"], "desc": r["desc"],
+            "unit": r["unit"], "count": 1, "total_qty": r["qty"],
+            "unit_price": r["unit_price"], "amount": r["amount"],
+        })
+        key = f'{r["itemno"]}#{idx}'
+        packages[key] = {"cml": r["itemno"],
+                         "vol": 0.0, "nw": 0.0, "gw": 0.0}
+        package_names[key] = r["desc"] or r["itemno"]
+
+    return rows, packages, package_names
+
+
+def build_merged_entries(parsed_files):
+    """
+    Groups parsed PKL/INV files by shipment (see _shipment_key) and merges
+    each matching PKL + INV pair into ONE entry: the packing list's normal
+    item/package data, with Unit Price + Amount added to each item row by
+    matching Item No. against the invoice's line items (summed if the
+    invoice lists the same item more than once, e.g. under two different
+    Customer Order Nos.).
+
+    Returns all_results: list of
+        (filename, summary_rows, packages, package_names, ship_to, invoice_amount)
+    - the same shape build_excel() and the preview builder expect.
+    invoice_amount is the shipment's total invoiced value (for the PKG
+    Summary subtotal row); it's 0 for a PKL with no matching invoice.
+    """
+    groups = OrderedDict()
+    for pf in parsed_files:
+        groups.setdefault(_shipment_key(pf), []).append(pf)
+
+    all_results = []
+
+    for key, items in groups.items():
+        pl_items = [p for p in items if p["type"] == "packing_list"]
+        inv_items = [p for p in items if p["type"] == "invoice"]
+
+        if pl_items:
+            # One sheet per shipment: base it on the packing list (if more
+            # than one PKL somehow shares a shipment key, only the first is
+            # used - that shouldn't normally happen).
+            base = pl_items[0]
+            summary = [dict(row) for row in base["summary"]]
+            packages = base["packages"]
+            package_names = base["package_names"]
+            ship_to = base["ship_to"]
+            if ship_to == "Unknown" and inv_items:
+                ship_to = inv_items[0]["ship_to"]
+
+            invoice_by_itemno = OrderedDict()
+            invoice_amount = 0.0
+            for inv in inv_items:
+                for r in inv["records"]:
+                    agg = invoice_by_itemno.setdefault(
+                        r["itemno"], {"qty": 0, "amount": 0.0})
+                    agg["qty"] += r["qty"]
+                    agg["amount"] += r["amount"]
+                    invoice_amount += r["amount"]
+
+            for row in summary:
+                match = invoice_by_itemno.get(row["itemno"])
+                if match:
+                    row["unit_price"] = round(
+                        match["amount"] / match["qty"], 4) if match["qty"] else 0
+                    row["amount"] = round(match["amount"], 2)
+                else:
+                    row["unit_price"] = ""
+                    row["amount"] = ""
+
+            all_results.append(
+                (base["filename"], summary, packages, package_names,
+                 ship_to, invoice_amount))
+        else:
+            # No matching packing list - keep the invoice(s) as their own
+            # sheet(s) so the data still shows up somewhere.
+            for inv in inv_items:
+                summary, packages, package_names = summarize_invoice_only(
+                    inv["records"])
+                invoice_amount = sum(r["amount"] for r in inv["records"])
+                all_results.append(
+                    (inv["filename"], summary, packages, package_names,
+                     inv["ship_to"], invoice_amount))
+
+    return all_results
+
+
+# ---------------------------------------------------------------------------
 # EXCEL EXPORT (PKG Counter)
 # ---------------------------------------------------------------------------
 
@@ -527,7 +905,13 @@ def autosize(ws, headers, rows_as_strs):
 def build_excel(all_results):
     """
     all_results: list of tuples
-        (pdf_name, item_rows, packages, package_names, ship_to)
+        (pdf_name, item_rows, packages, package_names, ship_to, invoice_amount)
+
+    item_rows may carry "unit_price"/"amount" (blank string if no matching
+    invoice was found for that item) - that's the only content change to
+    the per-shipment item sheet vs. before: two extra columns, Unit Price
+    and Amount. invoice_amount (the shipment's total invoiced value) feeds
+    the Amount (USD) column on the PKG Summary subtotal row.
     """
     wb = Workbook()
     wb.remove(wb.active)
@@ -549,11 +933,11 @@ def build_excel(all_results):
                              end_color="305496", fill_type="solid")
     grand_font = Font(bold=True, color="FFFFFF")
 
-    item_headers = ["Item No.", "Customer Item No.",
-                    "Description", "Unit", "PKG (Count)", "Total Qty"]
+    item_headers = ["Item No.", "Customer Item No.", "Description", "Unit",
+                    "PKG (Count)", "Total Qty", "Unit Price", "Amount"]
 
-    # ---- Per-invoice item summary sheets ----
-    for pdf_name, rows, packages, package_names, ship_to in all_results:
+    # ---- Per-shipment item summary sheets ----
+    for pdf_name, rows, packages, package_names, ship_to, invoice_amount in all_results:
         base_title = os.path.splitext(pdf_name)[0]
         sheet_title = safe_sheet_name(base_title, used_names)
         ws = wb.create_sheet(title=sheet_title)
@@ -563,106 +947,123 @@ def build_excel(all_results):
             ws.append([
                 row["itemno"], row["custitem"], desc_display,
                 row["unit"], row["count"], row["total_qty"],
+                row.get("unit_price", ""), row.get("amount", ""),
             ])
         row_strs = [
             [row["itemno"], row["custitem"], display_name(row["custitem"], row["desc"]),
-             row["unit"], str(row["count"]), str(row["total_qty"])]
+             row["unit"], str(row["count"]), str(row["total_qty"]),
+             (f'{row["unit_price"]:.4f}' if isinstance(row.get("unit_price"), (int, float)) else ""),
+             (f'{row["amount"]:.2f}' if isinstance(row.get("amount"), (int, float)) else "")]
             for row in rows
         ]
         autosize(ws, item_headers, row_strs)
         ws.freeze_panes = "A2"
 
-    # ---- PKG Summary sheet, grouped by Ship To (factory), then invoice ----
+    # ---- PKG Summary sheet, grouped by Ship To (factory), then shipment ----
+    # Column G (Amount (USD)) is the only new column vs. the original app -
+    # it carries each shipment's total invoiced amount on the Subtotal
+    # row (blank on individual CML/package rows, since price isn't known
+    # at that granularity).
     pkg_headers = ["Ship To", "Invoice", "CML No.", "Description",
-                   "Net Weight (kg)", "Gross Weight (kg)"]
+                   "Net Weight (kg)", "Gross Weight (kg)", "Amount (USD)"]
     ws_pkg = wb.create_sheet(title="PKG Summary")
     style_header(ws_pkg, pkg_headers, header_fill, header_font)
 
     # Group results by detected Ship To, preserving first-seen order.
     grouped_by_ship_to = OrderedDict()
-    for pdf_name, rows, packages, package_names, ship_to in all_results:
+    for pdf_name, rows, packages, package_names, ship_to, invoice_amount in all_results:
         grouped_by_ship_to.setdefault(ship_to, []).append(
-            (pdf_name, packages, package_names))
+            (pdf_name, packages, package_names, invoice_amount))
 
     pkg_row_strs = []
     grand_nw = 0.0
     grand_gw = 0.0
+    grand_amount = 0.0
     grand_pkg_count = 0
 
     for ship_to, items in grouped_by_ship_to.items():
         # --- Factory section header row ---
         section_row_idx = ws_pkg.max_row + 1
-        ws_pkg.append([f"Ship To: {ship_to}", "", "", "", "", ""])
+        ws_pkg.append([f"Ship To: {ship_to}", "", "", "", "", "", ""])
         ws_pkg.merge_cells(start_row=section_row_idx, start_column=1,
                            end_row=section_row_idx, end_column=len(pkg_headers))
         for col_idx in range(1, len(pkg_headers) + 1):
             cell = ws_pkg.cell(row=section_row_idx, column=col_idx)
             cell.fill = section_fill
             cell.font = section_font
-        pkg_row_strs.append([f"Ship To: {ship_to}", "", "", "", "", ""])
+        pkg_row_strs.append([f"Ship To: {ship_to}", "", "", "", "", "", ""])
 
         ship_nw = 0.0
         ship_gw = 0.0
+        ship_amount = 0.0
         ship_pkg_count = 0
 
-        for pdf_name, packages, package_names in items:
+        for pdf_name, packages, package_names, invoice_amount in items:
             invoice_label = os.path.splitext(pdf_name)[0]
             inv_nw = 0.0
             inv_gw = 0.0
 
-            for pkg in packages.values():
-                name = package_names.get(pkg["cml"], "")
+            for key, pkg in packages.items():
+                name = package_names.get(key, "")
                 ws_pkg.append([ship_to, invoice_label, pkg["cml"], name,
-                               pkg["nw"], pkg["gw"]])
+                               pkg["nw"], pkg["gw"], ""])
                 pkg_row_strs.append(
                     [ship_to, invoice_label, pkg["cml"], name,
-                     f'{pkg["nw"]:.3f}', f'{pkg["gw"]:.3f}'])
+                     f'{pkg["nw"]:.3f}', f'{pkg["gw"]:.3f}', ""])
                 inv_nw += pkg["nw"]
                 inv_gw += pkg["gw"]
 
             sub_row_idx = ws_pkg.max_row + 1
             ws_pkg.append([ship_to, invoice_label,
                            f"Subtotal ({len(packages)} pkg)", "",
-                           round(inv_nw, 3), round(inv_gw, 3)])
+                           round(inv_nw, 3), round(inv_gw, 3),
+                           round(invoice_amount, 2) if invoice_amount else ""])
             for col_idx in range(1, len(pkg_headers) + 1):
                 cell = ws_pkg.cell(row=sub_row_idx, column=col_idx)
                 cell.fill = sub_fill
                 cell.font = sub_font
             pkg_row_strs.append(
                 [ship_to, invoice_label, f"Subtotal ({len(packages)} pkg)", "",
-                 f"{inv_nw:.3f}", f"{inv_gw:.3f}"])
+                 f"{inv_nw:.3f}", f"{inv_gw:.3f}",
+                 f"{invoice_amount:.2f}" if invoice_amount else ""])
 
             ship_nw += inv_nw
             ship_gw += inv_gw
+            ship_amount += invoice_amount
             ship_pkg_count += len(packages)
 
         # --- Factory (Ship To) subtotal row ---
         factory_row_idx = ws_pkg.max_row + 1
         ws_pkg.append(["", f"{ship_to} Total ({ship_pkg_count} pkg)", "", "",
-                       round(ship_nw, 3), round(ship_gw, 3)])
+                       round(ship_nw, 3), round(ship_gw, 3),
+                       round(ship_amount, 2) if ship_amount else ""])
         for col_idx in range(1, len(pkg_headers) + 1):
             cell = ws_pkg.cell(row=factory_row_idx, column=col_idx)
             cell.fill = factory_fill
             cell.font = factory_font
         pkg_row_strs.append(
             ["", f"{ship_to} Total ({ship_pkg_count} pkg)", "", "",
-             f"{ship_nw:.3f}", f"{ship_gw:.3f}"])
+             f"{ship_nw:.3f}", f"{ship_gw:.3f}",
+             f"{ship_amount:.2f}" if ship_amount else ""])
 
         grand_nw += ship_nw
         grand_gw += ship_gw
+        grand_amount += ship_amount
         grand_pkg_count += ship_pkg_count
 
     # --- Grand total row across all factories ---
     grand_row_idx = ws_pkg.max_row + 1
     ws_pkg.append(["", f"Grand Total ({grand_pkg_count} pkg)", "", "",
-                   round(grand_nw, 3), round(grand_gw, 3)])
+                   round(grand_nw, 3), round(grand_gw, 3),
+                   round(grand_amount, 2) if grand_amount else ""])
     for col_idx in range(1, len(pkg_headers) + 1):
         cell = ws_pkg.cell(row=grand_row_idx, column=col_idx)
         cell.fill = grand_fill
         cell.font = grand_font
     pkg_row_strs.append(
         ["", f"Grand Total ({grand_pkg_count} pkg)", "", "",
-         f"{grand_nw:.3f}", f"{grand_gw:.3f}"])
+         f"{grand_nw:.3f}", f"{grand_gw:.3f}",
+         f"{grand_amount:.2f}" if grand_amount else ""])
 
     autosize(ws_pkg, pkg_headers, pkg_row_strs)
     ws_pkg.freeze_panes = "A2"
@@ -690,7 +1091,9 @@ def count_pkg():
 
     # Save every uploaded PDF to disk right away - this is fast (no parsing
     # yet), so the HTTP request can return almost instantly instead of
-    # staying open for however long parsing the whole batch takes.
+    # staying open for however long parsing the whole batch takes. PKL and
+    # INV files can be mixed freely in the same upload - matching PDFs for
+    # the same shipment are merged into one sheet in the background job.
     saved_files = []
     for f in files:
         if not f.filename.lower().endswith(".pdf"):
