@@ -99,6 +99,7 @@ DESC_RE = re.compile(r'^(?P<custitem>\S*\d\S*)\s+(?P<desc>.+)$')
 HEADER_PREFIXES = (
     "CML No.", "Customer Order No.", "Customer Item No.",
     "Page", "Total Package", "Model",
+    "Phone", "Fax", "Tel", "Tel.", "Email",
 )
 
 # Marker used to find the "Ship to" company name on page 1.
