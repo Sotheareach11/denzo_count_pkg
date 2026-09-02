@@ -11,7 +11,14 @@ Run locally:
     python app.py
 
 Run in production (Render Start Command):
-    gunicorn app:app --workers 2 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+    gunicorn app:app --workers 1 --threads 4 --timeout 180 --bind 0.0.0.0:$PORT
+
+    NOTE: On a low-RAM Render plan (512MB-1GB), use --workers 1. Each
+    gunicorn worker loads a full separate copy of the app + its libraries
+    (pdfplumber, openpyxl, etc.) into memory - 2 workers roughly doubles
+    baseline memory use before you've even processed a single PDF. With
+    threads instead of workers you still get concurrency without the
+    memory multiplication.
 
 Two tools in this app:
   1. PKG Counter ("/")        - upload packing list PDFs, get an Excel
@@ -27,6 +34,7 @@ Two tools in this app:
 import os
 import re
 import io
+import gc
 import uuid
 import shutil
 from collections import OrderedDict
@@ -194,6 +202,11 @@ def parse_packing_list(pdf_path):
                 if line.startswith(HEADER_PREFIXES):
                     continue
                 lines.append(line)
+            # pdfplumber caches each page's parsed layout objects (chars,
+            # lines, images, etc.) for the lifetime of the `pdf` object.
+            # On multi-page PDFs that adds up fast - release it as soon as
+            # we're done reading this page's text.
+            page.flush_cache()
 
     records = []
     packages = OrderedDict()
@@ -597,8 +610,17 @@ def count_pkg():
                 "total_nw": round(total_nw, 3),
                 "total_gw": round(total_gw, 3),
             })
+
+            # `records` can be sizeable for big packing lists and is only
+            # needed transiently to build `summary` above - drop it now
+            # rather than letting it ride along for the rest of the batch.
+            del records
         finally:
             os.remove(temp_path)
+            # Release pdfplumber's internal buffers for this file before
+            # moving on to the next one, so memory doesn't climb steadily
+            # across a large batch of PDFs.
+            gc.collect()
 
     if not all_results:
         return jsonify({"error": "No valid PDF data extracted."}), 400
