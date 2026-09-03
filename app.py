@@ -600,7 +600,7 @@ INVOICE_LINE_SKIP_PREFIXES = (
 # Anchored start-to-end so it can't accidentally match a header/footer line
 # that happens to contain some of these tokens.
 ITEM_PRICE_RE = re.compile(
-    r'^(?:(?P<itemno>\S+)\s+)?(?P<unit>[A-Za-z]+)\s+(?P<qty>[\d,]+)\s+'
+    r'^(?:(?P<lineno>\d+)\s+)?(?:(?P<itemno>\S+)\s+)?(?P<unit>[A-Za-z]+)\s+(?P<qty>[\d,]+)\s+'
     r'(?P<unitprice>[\d.,]+)\s+(?P<amount>[\d.,]+)$'
 )
 
